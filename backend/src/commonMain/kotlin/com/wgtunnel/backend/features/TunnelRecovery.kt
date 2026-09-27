@@ -14,10 +14,13 @@ import com.wgtunnel.backend.util.findEndpointMismatches
 import com.wgtunnel.backend.util.hasIpv6Peers
 import com.wgtunnel.parser.ActiveConfig
 import com.wgtunnel.parser.PeerSection
+import kotlin.concurrent.atomics.AtomicInt
 import kotlin.concurrent.atomics.AtomicReference
 import kotlin.concurrent.atomics.ExperimentalAtomicApi
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.seconds
+import kotlin.time.TimeMark
+import kotlin.time.TimeSource
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
@@ -27,10 +30,12 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 
 internal class TunnelRecovery(
     private val tunnelId: Int,
@@ -74,6 +79,8 @@ internal class TunnelRecovery(
         val networkHasIpv6: Boolean,
         val activeNetworkKey: String?,
         val deviceAwake: Boolean,
+        // Goes up on every wake signal, screen on, unlock, leaving Doze, resume from sleep
+        val wakeEpoch: Long = 0L,
         val recovery: Tunnel.Feature.Recovery = IDLE_RECOVERY,
     )
 
@@ -85,9 +92,30 @@ internal class TunnelRecovery(
     @OptIn(ExperimentalAtomicApi::class)
     private fun CoroutineScope.runFailureRecovery() {
         launch {
+            // Wakes and network changes are counted here, before a snapshot is published, so the
+            // loop below can never see one without its signal
+            val signals = AtomicInt(0)
+            val lastSignal = AtomicReference<TimeMark?>(null)
+            var lastWake: Long? = null
+            var lastKey: String? = null
+
             val snapshots =
                 host
                     .observe()
+                    .onEach { snap ->
+                        val previousWake = lastWake
+                        val woke = previousWake != null && snap.wakeEpoch != previousWake
+                        val moved =
+                            previousWake != null &&
+                                snap.activeNetworkKey != null &&
+                                snap.activeNetworkKey != lastKey
+                        lastWake = snap.wakeEpoch
+                        snap.activeNetworkKey?.let { lastKey = it }
+                        if (woke || moved) {
+                            lastSignal.store(TimeSource.Monotonic.markNow())
+                            signals.fetchAndAdd(1)
+                        }
+                    }
                     .stateIn(
                         scope = this,
                         started = SharingStarted.Eagerly,
@@ -122,31 +150,41 @@ internal class TunnelRecovery(
             }
 
             var seamlessRecoveryAttempted = 0
-            // Track idle to active so leaving Doze refreshes the bounce counter as it is a common
-            // source of tunnel failures
-            var wasDeviceAwake = snapshots.value.deviceAwake
+            var exhausted = false
+            // When the last bounce ran, for the cooldown on the quick settle
+            var lastBounce: TimeMark? = null
+            // The first bounce after a wake or network change waits only a short settle
+            var fastSettle = false
+            var seenSignals = signals.load()
 
-            fun noteDeviceAwake(snap: Snapshot) {
-                if (snap.deviceAwake && !wasDeviceAwake) {
-                    if (seamlessRecoveryAttempted != 0) {
-                        log.d {
-                            "Recovery: left device idle, resetting bounce attempts for tunnel $tunnelId (was $seamlessRecoveryAttempted)"
-                        }
+            fun changedSince(): Boolean = signals.load() != seenSignals
+
+            // A wake, unlock or new network makes earlier attempts stale, so the budget refills.
+            fun refreshBudget() {
+                val current = signals.load()
+                if (current == seenSignals) return
+                seenSignals = current
+                if (seamlessRecoveryAttempted != 0 || exhausted) {
+                    log.d {
+                        "Recovery: wake or network change, resetting bounce attempts for tunnel $tunnelId (was $seamlessRecoveryAttempted)"
                     }
-                    seamlessRecoveryAttempted = 0
                 }
-                wasDeviceAwake = snap.deviceAwake
+                seamlessRecoveryAttempted = 0
+                exhausted = false
+                // Only a signal from the last minute earns the short settle
+                fastSettle =
+                    lastSignal.load()?.let { it.elapsedNow() < FRESH_SIGNAL_WINDOW } == true
             }
 
             while (isActive) {
                 // Arm only on HandshakeFailure — not Starting/unknown
                 snapshots.first { it.shouldArmFailureRecovery }
                 log.i { "Recovery episode started for tunnel $tunnelId" }
-                noteDeviceAwake(snapshots.value)
+                refreshBudget()
 
                 // Stay until Healthy (or network unusable), including bounce Down/Starting
                 while (isActive && snapshots.value.shouldKeepFailureRecoveryEpisode) {
-                    noteDeviceAwake(snapshots.value)
+                    refreshBudget()
 
                     // Bootstrap in flight, wait until it is completed while keeping the session
                     // active
@@ -155,7 +193,7 @@ internal class TunnelRecovery(
                         snapshots.first {
                             !it.bootstrapPending || !it.shouldKeepFailureRecoveryEpisode
                         }
-                        noteDeviceAwake(snapshots.value)
+                        refreshBudget()
                         if (!snapshots.value.shouldKeepFailureRecoveryEpisode) break
                         // Bootstrap finished while still unhealthy, fall through to a fresh
                         // stabilize window before we act
@@ -170,14 +208,14 @@ internal class TunnelRecovery(
                     if (rec.dynamicDnsRecovery || willTryIpv4) {
                         delay(stabilizeWindow)
 
-                        noteDeviceAwake(snapshots.value)
+                        refreshBudget()
                         if (!snapshots.value.shouldKeepFailureRecoveryEpisode) break
                         if (snapshots.value.bootstrapPending) continue
 
                         if (snapshots.value.recovery.dynamicDnsRecovery) {
                             tryDynamicDnsRecovery(snapshots.value)
                             delay(stabilizeWindow)
-                            noteDeviceAwake(snapshots.value)
+                            refreshBudget()
                             if (!snapshots.value.shouldKeepFailureRecoveryEpisode) break
                             if (snapshots.value.bootstrapPending) continue
                         }
@@ -190,33 +228,81 @@ internal class TunnelRecovery(
                         ) {
                             tryLightIpv4Fallback(snap)
                             delay(stabilizeWindow)
-                            noteDeviceAwake(snapshots.value)
+                            refreshBudget()
                             if (!snapshots.value.shouldKeepFailureRecoveryEpisode) break
                             if (snapshots.value.bootstrapPending) continue
                         }
                     }
 
                     val beforeBounce = snapshots.value
-                    noteDeviceAwake(beforeBounce)
-                    if (
-                        beforeBounce.recovery.seamlessRecovery &&
-                            !beforeBounce.bootstrapPending &&
-                            seamlessRecoveryAttempted < MAX_SEAMLESS_RECOVERY_RETRIES
-                    ) {
-                        delay(beforeBounce.recovery.bounceDelaySeconds.seconds)
-                        val ready = snapshots.value
-                        noteDeviceAwake(ready)
-                        if (!ready.shouldKeepFailureRecoveryEpisode) break
-                        if (ready.bootstrapPending) continue
-                        if (!ready.recovery.seamlessRecovery) continue
+                    refreshBudget()
+                    if (!beforeBounce.recovery.seamlessRecovery || beforeBounce.bootstrapPending) {
+                        // Seamless disabled or bootstrap pending
+                        delay(stabilizeWindow)
+                        continue
+                    }
 
-                        tryFullTunnelBounce(ready.recovery.dynamicDnsRecovery)
-                        seamlessRecoveryAttempted++
+                    // A bounce while asleep has no network to come up on and would spend an
+                    // attempt, so we hold until the device wakes or the episode ends.
+                    if (!beforeBounce.deviceAwake) {
+                        log.d { "Recovery: device asleep, holding bounce for tunnel $tunnelId" }
+                        snapshots.first { it.deviceAwake || !it.shouldKeepFailureRecoveryEpisode }
+                        refreshBudget()
+                        continue
+                    }
+
+                    if (seamlessRecoveryAttempted >= MAX_SEAMLESS_RECOVERY_RETRIES) {
+                        // Out of attempts, the user needs to step in. Only a real change (wake,
+                        // unlock, new network) is a reason to try again, or the episode ending.
+                        if (!exhausted) {
+                            exhausted = true
+                            log.i {
+                                "Recovery: used $MAX_SEAMLESS_RECOVERY_RETRIES bounce attempts for tunnel $tunnelId, waiting for the device to wake or the network to change"
+                            }
+                        }
+                        snapshots.first { !it.shouldKeepFailureRecoveryEpisode || changedSince() }
+                        continue
+                    }
+
+                    val configured = beforeBounce.recovery.bounceDelaySeconds.seconds
+                    // The quick settle is for the first bounce after a wake or network change
+                    val cooledDown =
+                        lastBounce?.elapsedNow()?.let { it > FAST_BOUNCE_COOLDOWN } ?: true
+                    val wait =
+                        if (fastSettle && cooledDown) minOf(WAKE_SETTLE, configured) else configured
+                    fastSettle = false
+
+                    // A wake or network change during the wait restarts it, so a network that is
+                    // still changing isn't bounced until it settles. The episode ending ends it.
+                    val interrupted =
+                        withTimeoutOrNull(wait) {
+                            snapshots.first {
+                                !it.shouldKeepFailureRecoveryEpisode || changedSince()
+                            }
+                        }
+                    val ready = snapshots.value
+                    if (!ready.shouldKeepFailureRecoveryEpisode) break
+                    if (interrupted != null) {
+                        refreshBudget()
+                        continue
+                    }
+                    if (ready.bootstrapPending) continue
+                    if (!ready.recovery.seamlessRecovery) continue
+                    // Fell asleep during the wait
+                    if (!ready.deviceAwake) continue
+
+                    val bounced = tryFullTunnelBounce(ready.recovery.dynamicDnsRecovery)
+                    if (bounced) {
+                        lastBounce = TimeSource.Monotonic.markNow()
+                        if (seamlessRecoveryAttempted < MAX_SEAMLESS_RECOVERY_RETRIES) {
+                            seamlessRecoveryAttempted++
+                        }
                         log.i {
                             "Tunnel bounce attempt $seamlessRecoveryAttempted of $MAX_SEAMLESS_RECOVERY_RETRIES"
                         }
                     } else {
-                        // Seamless disabled, bootstrap pending, or max retries
+                        // Not a real attempt, don't spend the budget on it
+                        log.w { "Recovery: bounce did not run for tunnel $tunnelId" }
                         delay(stabilizeWindow)
                     }
                 }
@@ -228,6 +314,8 @@ internal class TunnelRecovery(
                     }
                 }
                 seamlessRecoveryAttempted = 0
+                exhausted = false
+                fastSettle = false
             }
         }
     }
@@ -338,7 +426,7 @@ internal class TunnelRecovery(
 
     // Full bounce now only does a fresh DNS request if tunnel is a DDNS tunnel.
     // NonCancellable so becoming Healthy mid-bounce cannot abort stop/start half-way.
-    private suspend fun tryFullTunnelBounce(withFreshResolution: Boolean) =
+    private suspend fun tryFullTunnelBounce(withFreshResolution: Boolean): Boolean =
         withContext(NonCancellable) {
             log.i {
                 "Seamless Recovery: bouncing tunnel $tunnelId (with fresh DNS request=$withFreshResolution)"
@@ -353,6 +441,7 @@ internal class TunnelRecovery(
                 }
                 host.emit(TunnelEvent.SeamlessRecoveryAttempted(tunnelId))
             }
+            didBounce
         }
 
     @OptIn(ExperimentalAtomicApi::class)
@@ -530,6 +619,15 @@ internal class TunnelRecovery(
         const val TUNNEL_HEALTH_STABILIZE_WINDOW_MILLIS = 8_000L
 
         const val MAX_SEAMLESS_RECOVERY_RETRIES = 8
+
+        /** Settle time after a wake or network change (radios and DHCP need a moment) */
+        val WAKE_SETTLE = 5.seconds
+
+        /** Quick settles need this long since the last bounce */
+        val FAST_BOUNCE_COOLDOWN = 30.seconds
+
+        /** How long a wake or network change still counts as recent */
+        val FRESH_SIGNAL_WINDOW = 60.seconds
 
         val IDLE_RECOVERY =
             Tunnel.Feature.Recovery(seamlessRecovery = false, dynamicDnsRecovery = false)

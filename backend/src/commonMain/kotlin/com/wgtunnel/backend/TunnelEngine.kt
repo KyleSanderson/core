@@ -12,6 +12,9 @@ internal interface TunnelEngine {
         handle: Int,
         mode: BackendMode,
         tunnelDnsConfig: TunnelDnsConfig? = null,
+        // A failed start normally destroys the VPN runtime. A bounce keeps it so a failure can't
+        // take down the interface that protects the user.
+        destroyRuntimeOnFailure: Boolean = true,
     ): EngineStartResult
 
     suspend fun stop(handle: Int, mode: BackendMode)

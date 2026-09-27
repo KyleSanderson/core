@@ -190,6 +190,7 @@ class TunnelBackend(
         tunnelId: Int,
         mode: BackendMode,
         tunnelDnsConfig: TunnelDnsConfig?,
+        destroyRuntimeOnFailure: Boolean = true,
     ): EngineStartResult =
         withContext(NonCancellable) {
             val handle = allocateTunnelHandle()
@@ -214,7 +215,14 @@ class TunnelBackend(
                 // live firewall state instead and ignores this field.
                 val killSwitchStampedDnsConfig =
                     tunnelDnsConfig?.copy(killSwitchEnabled = _status.value.killSwitch.enabled)
-                val result = engine.start(tunnelId, handle, mode, killSwitchStampedDnsConfig)
+                val result =
+                    engine.start(
+                        tunnelId,
+                        handle,
+                        mode,
+                        killSwitchStampedDnsConfig,
+                        destroyRuntimeOnFailure,
+                    )
                 nativeOwnedHandles.add(handle)
                 updateActiveTunnel(tunnelId) {
                     it.copy(
@@ -312,10 +320,21 @@ class TunnelBackend(
         mode: BackendMode,
         dns: TunnelDnsConfig?,
     ): Boolean {
-        stopNativeKeepMapped(handle, mode)
-        recreateVpnInterfaceIfNeeded(tunnel, mode)
-        startEngineAndRegister(tunnel.id, mode, dns)
+        restartDevice(handle, tunnel, mode, mode, dns)
         return true
+    }
+
+    // A failed start here must not take the VPN down, see bounceTunnelDevice
+    private suspend fun restartDevice(
+        handle: Int,
+        tunnel: Tunnel,
+        stopMode: BackendMode,
+        runtimeMode: BackendMode,
+        dns: TunnelDnsConfig?,
+    ) {
+        stopNativeKeepMapped(handle, stopMode)
+        recreateVpnInterfaceIfNeeded(tunnel, runtimeMode)
+        startEngineAndRegister(tunnel.id, runtimeMode, dns, destroyRuntimeOnFailure = false)
     }
 
     /** Stop native tunnel and drop ownership; keep Kotlin maps until re-register. */
@@ -342,9 +361,7 @@ class TunnelBackend(
                 }
 
         val runtimeMode = mode.withEndpointsFrom(activeConfig)
-        stopNativeKeepMapped(handle, mode)
-        recreateVpnInterfaceIfNeeded(tunnel, runtimeMode)
-        startEngineAndRegister(tunnel.id, runtimeMode, tunnelDnsConfig)
+        restartDevice(handle, tunnel, mode, runtimeMode, tunnelDnsConfig)
         return true
     }
 
@@ -404,13 +421,7 @@ class TunnelBackend(
             )
         }
 
-        stopNativeKeepMapped(handle, mode)
-        recreateVpnInterfaceIfNeeded(tunnel, runtimeMode)
-        startEngineAndRegister(
-            tunnel.id,
-            runtimeMode,
-            mergedResolution.resolvedTunnelDnsConfig,
-        )
+        restartDevice(handle, tunnel, mode, runtimeMode, mergedResolution.resolvedTunnelDnsConfig)
         return true
     }
 
@@ -446,9 +457,19 @@ class TunnelBackend(
                 throw t
             } catch (t: Throwable) {
                 log.e(t) { "Tunnel bounce failed for $tunnelId" }
+                if (!isDeviceUp(tunnelId)) {
+                    // The old device is stopped and no new one started. Leave the VPN as it is and
+                    // the tunnel Down for the user to turn off, and stop recovery so it can't
+                    // keep restarting a tunnel that failed for a reason it can't fix.
+                    updateTunnelTransportState(tunnelId, Tunnel.State.Down)
+                    tunnelJobs.remove(tunnelId)?.cancel()
+                }
                 false
             }
         }
+
+    private fun isDeviceUp(tunnelId: Int): Boolean =
+        byTunnelId[tunnelId]?.let { it in nativeOwnedHandles } == true
 
     private fun startTunnelBootstrapJob(
         tunnel: Tunnel,
@@ -801,8 +822,8 @@ class TunnelBackend(
                                     combine(
                                             status.mapNotNull { it.activeTunnels[tunnel.id] },
                                             networkMonitor.networkState.filterNotNull(),
-                                            powerManager.deviceAwake,
-                                        ) { active, network, awake ->
+                                            powerManager.powerState,
+                                        ) { active, network, power ->
                                             TunnelRecovery.Snapshot(
                                                 shouldArmFailureRecovery =
                                                     active.shouldArmFailureRecovery(
@@ -822,7 +843,8 @@ class TunnelBackend(
                                                     active.lastBootstrapResolution?.peerKeyResults,
                                                 networkHasIpv6 = network.hasIpv6,
                                                 activeNetworkKey = network.key,
-                                                deviceAwake = awake,
+                                                deviceAwake = power.awake,
+                                                wakeEpoch = power.wakeCount,
                                                 recovery = liveRecoveryFeature(active, mode),
                                             )
                                         }

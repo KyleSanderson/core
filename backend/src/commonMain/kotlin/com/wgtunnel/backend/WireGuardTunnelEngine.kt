@@ -28,6 +28,7 @@ internal class WireGuardTunnelEngine(private val runtimeManager: RuntimeManager)
         handle: Int,
         mode: BackendMode,
         tunnelDnsConfig: TunnelDnsConfig?,
+        destroyRuntimeOnFailure: Boolean,
     ): EngineStartResult {
         val ifName = interfacePrefix() + tunnelId
 
@@ -89,7 +90,15 @@ internal class WireGuardTunnelEngine(private val runtimeManager: RuntimeManager)
                     dnsJson,
                 )
             }
-            is BackendMode.Vpn -> startVpnTunnel(tunnelId, handle, ifName, mode.config, dnsJson)
+            is BackendMode.Vpn ->
+                startVpnTunnel(
+                    tunnelId,
+                    handle,
+                    ifName,
+                    mode.config,
+                    dnsJson,
+                    destroyRuntimeOnFailure,
+                )
         }
 
         return EngineStartResult(
@@ -135,6 +144,7 @@ internal class WireGuardTunnelEngine(private val runtimeManager: RuntimeManager)
         ifName: String,
         config: Config,
         dnsConfigJson: String?,
+        destroyRuntimeOnFailure: Boolean,
     ) {
         runtimeManager.getOrCreateVpnRuntime()
         val tunFd =
@@ -154,7 +164,9 @@ internal class WireGuardTunnelEngine(private val runtimeManager: RuntimeManager)
                 runtimeManager.uapiPath,
             )
         if (rc < 0) {
-            runCatching { runtimeManager.destroyVpnRuntime(listOf(tunnelId)) }
+            if (destroyRuntimeOnFailure) {
+                runCatching { runtimeManager.destroyVpnRuntime(listOf(tunnelId)) }
+            }
             throw BackendException.InternalError("Internal native error with code: $rc")
         }
     }
