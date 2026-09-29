@@ -81,11 +81,11 @@ func createInterface(ifName string, config string) int32 {
 		mtu = 1280
 	}
 
-	tunDev, err := tun.CreateTUN(tunCreateName(ifName), mtu)
+	tunDev, err := createTUN(tunCreateName(ifName), mtu)
 	if err != nil {
 		log.Error(tag, "CreateTUN: %v", err)
 		removeStaleTun(ifName)
-		tunDev, err = tun.CreateTUN(ifName, mtu)
+		tunDev, err = createTUN(ifName, mtu)
 		if err != nil {
 			cleanupReserve()
 			log.Error(tag, "CreateTUN retry: %v", err)

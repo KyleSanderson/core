@@ -1,6 +1,8 @@
-//go:build !android && !linux
+//go:build !android && !linux && !windows
 
 package vpn
+
+import "github.com/amnezia-vpn/amneziawg-go/v3/tun"
 
 func desktopIfaceExists(ifName string) bool {
 	_ = ifName
@@ -8,11 +10,15 @@ func desktopIfaceExists(ifName string) bool {
 }
 
 func removeStaleTun(ifName string) {
-	// For Windows and macOS closing the tun.Device removes the adapter. A leftover
-	// name is recovered on the next CreateTUN
+	// For macOS closing the tun.Device removes the adapter. A leftover name is
+	// recovered on the next CreateTUN
 	_ = ifName
 }
 
 func cleanupOrphanedDesktopIface(ifName string) {
 	_ = ifName
+}
+
+func createTUN(ifName string, mtu int) (tun.Device, error) {
+	return tun.CreateTUN(ifName, mtu)
 }

@@ -3,6 +3,7 @@
 package vpn
 
 import (
+	"github.com/amnezia-vpn/amneziawg-go/v3/tun"
 	"github.com/vishvananda/netlink"
 	"github.com/wgtunnel/backend/log"
 	"github.com/wgtunnel/backend/vpn/firewall/osfirewall/firewallmgr"
@@ -44,4 +45,8 @@ func cleanupOrphanedDesktopIface(ifName string) {
 	if err := rt.Close(); err != nil {
 		log.Error(tag, "orphan cleanup close %s: %v", ifName, err)
 	}
+}
+
+func createTUN(ifName string, mtu int) (tun.Device, error) {
+	return tun.CreateTUN(ifName, mtu)
 }
