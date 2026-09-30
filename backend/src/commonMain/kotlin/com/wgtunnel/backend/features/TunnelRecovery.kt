@@ -89,6 +89,12 @@ internal class TunnelRecovery(
         launch { runIpv6EndpointRecoveryJob() }
     }
 
+    private enum class LoopStep {
+        BREAK_EPISODE,
+        CONTINUE_EPISODE,
+        PROCEED,
+    }
+
     @OptIn(ExperimentalAtomicApi::class)
     private fun CoroutineScope.runFailureRecovery() {
         launch {
@@ -176,134 +182,161 @@ internal class TunnelRecovery(
                     lastSignal.load()?.let { it.elapsedNow() < FRESH_SIGNAL_WINDOW } == true
             }
 
+            // Bootstrap in flight so wait until it finishes, keeping the session active.
+            suspend fun awaitBootstrap(): LoopStep {
+                if (!snapshots.value.bootstrapPending) return LoopStep.PROCEED
+                log.d { "Recovery: waiting for bootstrap to finish for tunnel $tunnelId" }
+                snapshots.first { !it.bootstrapPending || !it.shouldKeepFailureRecoveryEpisode }
+                refreshBudget()
+                if (!snapshots.value.shouldKeepFailureRecoveryEpisode) return LoopStep.BREAK_EPISODE
+                // Bootstrap finished while still unhealthy, fall through to a fresh stabilize
+                // window before we act
+                return LoopStep.PROCEED
+            }
+
+            // DDNS re-resolution and/or a light IPv4 fallback, each behind its own stabilize
+            // window.
+            suspend fun attemptDdnsAndIpv4Fallback(): LoopStep {
+                val rec = snapshots.value.recovery
+                val willTryIpv4 =
+                    rec.ipv4Fallback &&
+                        snapshots.value.activeNetworkKey != null &&
+                        snapshots.value.activeNetworkKey != lastIpv4FallbackNetworkKey.load()
+                if (!(rec.dynamicDnsRecovery || willTryIpv4)) return LoopStep.PROCEED
+
+                delay(stabilizeWindow)
+                refreshBudget()
+                if (!snapshots.value.shouldKeepFailureRecoveryEpisode) return LoopStep.BREAK_EPISODE
+                if (snapshots.value.bootstrapPending) return LoopStep.CONTINUE_EPISODE
+
+                if (snapshots.value.recovery.dynamicDnsRecovery) {
+                    tryDynamicDnsRecovery(snapshots.value)
+                    delay(stabilizeWindow)
+                    refreshBudget()
+                    if (!snapshots.value.shouldKeepFailureRecoveryEpisode) {
+                        return LoopStep.BREAK_EPISODE
+                    }
+                    if (snapshots.value.bootstrapPending) return LoopStep.CONTINUE_EPISODE
+                }
+
+                val snap = snapshots.value
+                if (
+                    snap.recovery.ipv4Fallback &&
+                        (snap.activeNetworkKey != null) &&
+                        (snap.activeNetworkKey != lastIpv4FallbackNetworkKey.load())
+                ) {
+                    tryLightIpv4Fallback(snap)
+                    delay(stabilizeWindow)
+                    refreshBudget()
+                    if (!snapshots.value.shouldKeepFailureRecoveryEpisode) {
+                        return LoopStep.BREAK_EPISODE
+                    }
+                    if (snapshots.value.bootstrapPending) return LoopStep.CONTINUE_EPISODE
+                }
+                return LoopStep.PROCEED
+            }
+
+            // Holds until the device wakes (a bounce while asleep has no network to come up on
+            // and would spend an attempt for nothing), waits out the bounce window, then
+            // performs the bounce if nothing changed in the meantime.
+            suspend fun waitForWindowAndBounce(): LoopStep {
+                val beforeBounce = snapshots.value
+                refreshBudget()
+                if (!beforeBounce.recovery.seamlessRecovery || beforeBounce.bootstrapPending) {
+                    // Seamless disabled or bootstrap pending
+                    delay(stabilizeWindow)
+                    return LoopStep.CONTINUE_EPISODE
+                }
+
+                // A bounce while asleep has no network to come up on and would spend an
+                // attempt, so we hold until the device wakes or the episode ends.
+                if (!beforeBounce.deviceAwake) {
+                    log.d { "Recovery: device asleep, holding bounce for tunnel $tunnelId" }
+                    snapshots.first { it.deviceAwake || !it.shouldKeepFailureRecoveryEpisode }
+                    refreshBudget()
+                    return LoopStep.CONTINUE_EPISODE
+                }
+
+                if (seamlessRecoveryAttempted >= MAX_SEAMLESS_RECOVERY_RETRIES) {
+                    // Out of attempts, the user needs to step in. Only a real change (wake,
+                    // unlock, new network) is a reason to try again, or the episode ending.
+                    if (!exhausted) {
+                        exhausted = true
+                        log.i {
+                            "Recovery: used $MAX_SEAMLESS_RECOVERY_RETRIES bounce attempts for tunnel $tunnelId, waiting for the device to wake or the network to change"
+                        }
+                    }
+                    snapshots.first { !it.shouldKeepFailureRecoveryEpisode || changedSince() }
+                    return LoopStep.CONTINUE_EPISODE
+                }
+
+                val configured = beforeBounce.recovery.bounceDelaySeconds.seconds
+                // The quick settle is for the first bounce after a wake or network change
+                val cooledDown = lastBounce?.elapsedNow()?.let { it > FAST_BOUNCE_COOLDOWN } ?: true
+                val wait =
+                    if (fastSettle && cooledDown) minOf(WAKE_SETTLE, configured) else configured
+                fastSettle = false
+
+                // A wake or network change during the wait restarts it, so a network that is
+                // still changing isn't bounced until it settles. The episode ending ends it.
+                val interrupted =
+                    withTimeoutOrNull(wait) {
+                        snapshots.first { !it.shouldKeepFailureRecoveryEpisode || changedSince() }
+                    }
+                val ready = snapshots.value
+                if (!ready.shouldKeepFailureRecoveryEpisode) return LoopStep.BREAK_EPISODE
+                if (interrupted != null) {
+                    refreshBudget()
+                    return LoopStep.CONTINUE_EPISODE
+                }
+                if (ready.bootstrapPending) return LoopStep.CONTINUE_EPISODE
+                if (!ready.recovery.seamlessRecovery) return LoopStep.CONTINUE_EPISODE
+                // Fell asleep during the wait
+                if (!ready.deviceAwake) return LoopStep.CONTINUE_EPISODE
+
+                val bounced = tryFullTunnelBounce(ready.recovery.dynamicDnsRecovery)
+                if (bounced) {
+                    lastBounce = TimeSource.Monotonic.markNow()
+                    if (seamlessRecoveryAttempted < MAX_SEAMLESS_RECOVERY_RETRIES) {
+                        seamlessRecoveryAttempted++
+                    }
+                    log.i {
+                        "Tunnel bounce attempt $seamlessRecoveryAttempted of $MAX_SEAMLESS_RECOVERY_RETRIES"
+                    }
+                } else {
+                    // Not a real attempt, don't spend the budget on it
+                    log.w { "Recovery: bounce did not run for tunnel $tunnelId" }
+                    delay(stabilizeWindow)
+                }
+                return LoopStep.PROCEED
+            }
+
             while (isActive) {
-                // Arm only on HandshakeFailure — not Starting/unknown
+                // Arm only on HandshakeFailure, not Starting/unknown
                 snapshots.first { it.shouldArmFailureRecovery }
                 log.i { "Recovery episode started for tunnel $tunnelId" }
                 refreshBudget()
 
                 // Stay until Healthy (or network unusable), including bounce Down/Starting
-                while (isActive && snapshots.value.shouldKeepFailureRecoveryEpisode) {
+                episode@ while (isActive && snapshots.value.shouldKeepFailureRecoveryEpisode) {
                     refreshBudget()
 
-                    // Bootstrap in flight, wait until it is completed while keeping the session
-                    // active
-                    if (snapshots.value.bootstrapPending) {
-                        log.d { "Recovery: waiting for bootstrap to finish for tunnel $tunnelId" }
-                        snapshots.first {
-                            !it.bootstrapPending || !it.shouldKeepFailureRecoveryEpisode
-                        }
-                        refreshBudget()
-                        if (!snapshots.value.shouldKeepFailureRecoveryEpisode) break
-                        // Bootstrap finished while still unhealthy, fall through to a fresh
-                        // stabilize window before we act
+                    when (awaitBootstrap()) {
+                        LoopStep.BREAK_EPISODE -> break@episode
+                        LoopStep.CONTINUE_EPISODE -> continue@episode
+                        LoopStep.PROCEED -> Unit
                     }
 
-                    val rec = snapshots.value.recovery
-                    val willTryIpv4 =
-                        rec.ipv4Fallback &&
-                            snapshots.value.activeNetworkKey != null &&
-                            snapshots.value.activeNetworkKey != lastIpv4FallbackNetworkKey.load()
-
-                    if (rec.dynamicDnsRecovery || willTryIpv4) {
-                        delay(stabilizeWindow)
-
-                        refreshBudget()
-                        if (!snapshots.value.shouldKeepFailureRecoveryEpisode) break
-                        if (snapshots.value.bootstrapPending) continue
-
-                        if (snapshots.value.recovery.dynamicDnsRecovery) {
-                            tryDynamicDnsRecovery(snapshots.value)
-                            delay(stabilizeWindow)
-                            refreshBudget()
-                            if (!snapshots.value.shouldKeepFailureRecoveryEpisode) break
-                            if (snapshots.value.bootstrapPending) continue
-                        }
-
-                        val snap = snapshots.value
-                        if (
-                            snap.recovery.ipv4Fallback &&
-                                (snap.activeNetworkKey != null) &&
-                                (snap.activeNetworkKey != lastIpv4FallbackNetworkKey.load())
-                        ) {
-                            tryLightIpv4Fallback(snap)
-                            delay(stabilizeWindow)
-                            refreshBudget()
-                            if (!snapshots.value.shouldKeepFailureRecoveryEpisode) break
-                            if (snapshots.value.bootstrapPending) continue
-                        }
+                    when (attemptDdnsAndIpv4Fallback()) {
+                        LoopStep.BREAK_EPISODE -> break@episode
+                        LoopStep.CONTINUE_EPISODE -> continue@episode
+                        LoopStep.PROCEED -> Unit
                     }
 
-                    val beforeBounce = snapshots.value
-                    refreshBudget()
-                    if (!beforeBounce.recovery.seamlessRecovery || beforeBounce.bootstrapPending) {
-                        // Seamless disabled or bootstrap pending
-                        delay(stabilizeWindow)
-                        continue
-                    }
-
-                    // A bounce while asleep has no network to come up on and would spend an
-                    // attempt, so we hold until the device wakes or the episode ends.
-                    if (!beforeBounce.deviceAwake) {
-                        log.d { "Recovery: device asleep, holding bounce for tunnel $tunnelId" }
-                        snapshots.first { it.deviceAwake || !it.shouldKeepFailureRecoveryEpisode }
-                        refreshBudget()
-                        continue
-                    }
-
-                    if (seamlessRecoveryAttempted >= MAX_SEAMLESS_RECOVERY_RETRIES) {
-                        // Out of attempts, the user needs to step in. Only a real change (wake,
-                        // unlock, new network) is a reason to try again, or the episode ending.
-                        if (!exhausted) {
-                            exhausted = true
-                            log.i {
-                                "Recovery: used $MAX_SEAMLESS_RECOVERY_RETRIES bounce attempts for tunnel $tunnelId, waiting for the device to wake or the network to change"
-                            }
-                        }
-                        snapshots.first { !it.shouldKeepFailureRecoveryEpisode || changedSince() }
-                        continue
-                    }
-
-                    val configured = beforeBounce.recovery.bounceDelaySeconds.seconds
-                    // The quick settle is for the first bounce after a wake or network change
-                    val cooledDown =
-                        lastBounce?.elapsedNow()?.let { it > FAST_BOUNCE_COOLDOWN } ?: true
-                    val wait =
-                        if (fastSettle && cooledDown) minOf(WAKE_SETTLE, configured) else configured
-                    fastSettle = false
-
-                    // A wake or network change during the wait restarts it, so a network that is
-                    // still changing isn't bounced until it settles. The episode ending ends it.
-                    val interrupted =
-                        withTimeoutOrNull(wait) {
-                            snapshots.first {
-                                !it.shouldKeepFailureRecoveryEpisode || changedSince()
-                            }
-                        }
-                    val ready = snapshots.value
-                    if (!ready.shouldKeepFailureRecoveryEpisode) break
-                    if (interrupted != null) {
-                        refreshBudget()
-                        continue
-                    }
-                    if (ready.bootstrapPending) continue
-                    if (!ready.recovery.seamlessRecovery) continue
-                    // Fell asleep during the wait
-                    if (!ready.deviceAwake) continue
-
-                    val bounced = tryFullTunnelBounce(ready.recovery.dynamicDnsRecovery)
-                    if (bounced) {
-                        lastBounce = TimeSource.Monotonic.markNow()
-                        if (seamlessRecoveryAttempted < MAX_SEAMLESS_RECOVERY_RETRIES) {
-                            seamlessRecoveryAttempted++
-                        }
-                        log.i {
-                            "Tunnel bounce attempt $seamlessRecoveryAttempted of $MAX_SEAMLESS_RECOVERY_RETRIES"
-                        }
-                    } else {
-                        // Not a real attempt, don't spend the budget on it
-                        log.w { "Recovery: bounce did not run for tunnel $tunnelId" }
-                        delay(stabilizeWindow)
+                    when (waitForWindowAndBounce()) {
+                        LoopStep.BREAK_EPISODE -> break@episode
+                        LoopStep.CONTINUE_EPISODE -> continue@episode
+                        LoopStep.PROCEED -> Unit
                     }
                 }
 

@@ -20,15 +20,15 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 interface TunnelActions {
-    /** Bounded, and reports failure by logging. Success is judged by the running set after start. */
+    /**
+     * Bounded, and reports failure by logging. Success is judged by the running set after start.
+     */
     suspend fun start(id: Long)
 
     suspend fun stop(id: Long)
 }
 
-/**
- * How the platform changes the running tunnels.
- */
+/** How the platform changes the running tunnels. */
 interface AutoTunnelHost {
     /**
      * Runs [block] holding the same lock every user start/stop holds. Auto tunnel decides and acts
@@ -42,9 +42,9 @@ interface AutoTunnelHost {
  * Drives the running tunnels toward what [AutoTunnelEngine] wants, from live state.
  *
  * A single worker, triggers are conflated and never cancel work in flight. Each pass takes the
- * host's lock, reads the latest inputs and the live running set, acts, and repeats until the
- * engine has nothing left to do. Rapid network changes collapse into one pass against the newest
- * state, and the end state is always the engine's decision for the latest inputs.
+ * host's lock, reads the latest inputs and the live running set, acts, and repeats until the engine
+ * has nothing left to do. Rapid network changes collapse into one pass against the newest state,
+ * and the end state is always the engine's decision for the latest inputs.
  */
 class AutoTunnelReconciler(
     private val scope: CoroutineScope,
@@ -75,9 +75,7 @@ class AutoTunnelReconciler(
     // otherwise re-trigger forever, so we wait for the inputs to change.
     private var gaveUpOn: AutoTunnelSnapshot? = null
 
-    /**
-     * [inputs] is the network, policy and tunnels.
-     */
+    /** [inputs] is the network, policy and tunnels. */
     fun start(inputs: Flow<AutoTunnelSnapshot>) {
         stop()
         latest = null
@@ -85,25 +83,24 @@ class AutoTunnelReconciler(
         lastNetworkKey = null
         settled = false
         gaveUpOn = null
-        job =
-            scope.launch {
-                combine(
-                        inputs.onEach {
-                            latest = it
-                            updateFingerprint(it)
-                        },
-                        status.map { it.activeTunnels.keys }.distinctUntilChanged(),
-                    ) { _, _ ->
+        job = scope.launch {
+            combine(
+                    inputs.onEach {
+                        latest = it
+                        updateFingerprint(it)
+                    },
+                    status.map { it.activeTunnels.keys }.distinctUntilChanged(),
+                ) { _, _ ->
+                }
+                .conflate()
+                .collect {
+                    if (!settled) {
+                        delay(startupSettle)
+                        settled = true
                     }
-                    .conflate()
-                    .collect {
-                        if (!settled) {
-                            delay(startupSettle)
-                            settled = true
-                        }
-                        converge()
-                    }
-            }
+                    converge()
+                }
+        }
     }
 
     fun stop() {
@@ -128,7 +125,9 @@ class AutoTunnelReconciler(
                 Pass.Progressed -> stalled = 0
                 Pass.Stalled -> {
                     if (++stalled >= MAX_STALLED) {
-                        log.w { "No progress after $stalled attempts, waiting for inputs to change" }
+                        log.w {
+                            "No progress after $stalled attempts, waiting for inputs to change"
+                        }
                         gaveUpOn = latest
                         return
                     }
@@ -197,30 +196,29 @@ class AutoTunnelReconciler(
     // Grace period so flaky networks and transitions don't drop the tunnel
     private fun scheduleNoInternetStop() {
         if (noInternetJob?.isActive == true) return
-        noInternetJob =
-            scope.launch {
-                delay(noInternetGrace)
-                host.exclusively { actions ->
-                    val snapshot = latest ?: return@exclusively
-                    if (
-                        hasUserOverride ||
-                            snapshot.network.hasUsableNetwork ||
-                            !snapshot.policy.isStopOnNoInternetEnabled
-                    ) {
-                        log.d { "No internet grace expired, nothing to stop" }
-                        return@exclusively
-                    }
-                    val running = activeTunnelIds()
-                    if (running.isEmpty()) return@exclusively
-                    log.w { "No internet grace expired, stopping tunnels $running" }
-                    withContext(NonCancellable) {
-                        running.forEach { id ->
-                            runCatching { actions.stop(id) }
-                                .onFailure { log.e(it) { "Failed to stop tunnel $id" } }
-                        }
+        noInternetJob = scope.launch {
+            delay(noInternetGrace)
+            host.exclusively { actions ->
+                val snapshot = latest ?: return@exclusively
+                if (
+                    hasUserOverride ||
+                        snapshot.network.hasUsableNetwork ||
+                        !snapshot.policy.isStopOnNoInternetEnabled
+                ) {
+                    log.d { "No internet grace expired, nothing to stop" }
+                    return@exclusively
+                }
+                val running = activeTunnelIds()
+                if (running.isEmpty()) return@exclusively
+                log.w { "No internet grace expired, stopping tunnels $running" }
+                withContext(NonCancellable) {
+                    running.forEach { id ->
+                        runCatching { actions.stop(id) }
+                            .onFailure { log.e(it) { "Failed to stop tunnel $id" } }
                     }
                 }
             }
+        }
     }
 
     private fun cancelNoInternetStop() {
