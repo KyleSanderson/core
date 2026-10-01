@@ -49,8 +49,13 @@ data class Config(
     }
 
     companion object {
+        // Strips a leading UTF-8 BOM that some routers/export tools write config files
+        // with one
+        private fun normalizeConfigText(configString: String): String =
+            configString.removePrefix("﻿").replace("\r\n", "\n").replace("\r", "\n").trim()
+
         fun parseInterfaceQuickString(configString: String): Config {
-            val trimmed = configString.replace("\r\n", "\n").replace("\r", "\n").trim()
+            val trimmed = normalizeConfigText(configString)
             if (trimmed.isEmpty()) return parseQuickString("[Interface]")
             val hasInterface =
                 trimmed.lineSequence().any { it.trim().equals("[Interface]", ignoreCase = true) }
@@ -70,7 +75,7 @@ data class Config(
             var isFirstSectionFound = false
 
             // normalize and trim
-            val normalizedConfig = configString.replace("\r\n", "\n").replace("\r", "\n").trim()
+            val normalizedConfig = normalizeConfigText(configString)
 
             normalizedConfig.lines().forEach { line ->
                 val raw = line.trim()
@@ -89,7 +94,7 @@ data class Config(
                 // Handle Section Headers
                 if (raw.startsWith("[") && raw.endsWith("]")) {
                     isFirstSectionFound = true
-                    val sectionName = raw.substring(1, raw.length - 1).lowercase()
+                    val sectionName = raw.substring(1, raw.length - 1).trim().lowercase()
 
                     when (sectionName) {
                         "interface" -> {
