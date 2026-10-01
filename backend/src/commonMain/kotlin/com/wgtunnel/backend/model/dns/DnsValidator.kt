@@ -1,5 +1,6 @@
 package com.wgtunnel.backend.model.dns
 
+import com.wgtunnel.backend.util.DnsHostUtils
 import com.wgtunnel.backend.util.UrlParse
 
 enum class DnsEndpointProtocol {
@@ -133,17 +134,18 @@ object DnsValidator {
 
     private fun normalizeHostPort(value: String, defaultPort: Int): String {
         val (host, port) = TunnelDnsConfig.splitHostPort(value) ?: (value to null)
-        return if (port == null) "${host.trim()}:$defaultPort" else value
+        if (port != null) return value
+        val trimmedHost = host.trim()
+        // Re-bracket an IPv6 host
+        return if (trimmedHost.contains(":") && !trimmedHost.startsWith("[")) {
+            "[$trimmedHost]:$defaultPort"
+        } else {
+            "$trimmedHost:$defaultPort"
+        }
     }
 
     private fun isValidHostOrIp(value: String): Boolean {
-        return isValidIpv4(value) || isValidHostname(value)
-    }
-
-    private fun isValidIpv4(value: String): Boolean {
-        val parts = value.split(".")
-        if (parts.size != 4) return false
-        return parts.all { it.toIntOrNull()?.let { num -> num in 0..255 } == true }
+        return DnsHostUtils.isIpAddress(value) || isValidHostname(value)
     }
 
     private fun isValidHostname(value: String): Boolean {
