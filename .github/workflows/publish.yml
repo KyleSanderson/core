@@ -11,9 +11,42 @@ on:
 env:
   JAVA_VERSION: "21"
   JAVA_DISTRIBUTION: temurin
+  # LLVM MinGW for Windows Arm support
+  LLVM_MINGW_VERSION: "20260922"
 
 jobs:
+  build-macos-natives:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v5
+        with:
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: gradle
+          check-latest: false
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Build macOS native libraries (darwin-x64, darwin-aarch64)
+        run: ./gradlew :backend:buildDesktopNatives --no-configuration-cache --stacktrace --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-natives
+          if-no-files-found: error
+          path: |
+            backend/src/jvmMain/resources/natives/darwin-x64/**
+            backend/src/jvmMain/resources/natives/darwin-aarch64/**
+
   publish:
+    needs: build-macos-natives
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     env:
@@ -49,6 +82,11 @@ jobs:
       - name: Verify Gradle Wrapper
         uses: gradle/actions/wrapper-validation@v6
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-natives
+          path: backend/src/jvmMain/resources/natives
+
       - name: Install mingw-w64 and build tools
         run: |
           sudo apt-get update
@@ -59,6 +97,19 @@ jobs:
             ca-certificates
           x86_64-w64-mingw32-gcc --version
           x86_64-w64-mingw32-g++ --version
+
+      - name: Install llvm-mingw (aarch64 Windows cross-compiler)
+        run: |
+          set -euo pipefail
+          curl -fsSL -o llvm-mingw.tar.xz \
+            "https://github.com/mstorsjo/llvm-mingw/releases/download/${LLVM_MINGW_VERSION}/llvm-mingw-${LLVM_MINGW_VERSION}-ucrt-ubuntu-22.04-x86_64.tar.xz"
+          tar -xf llvm-mingw.tar.xz
+          echo "$PWD/llvm-mingw-${LLVM_MINGW_VERSION}-ucrt-ubuntu-22.04-x86_64/bin" >> "$GITHUB_PATH"
+
+      - name: Verify aarch64-w64-mingw32 cross-compiler
+        run: |
+          aarch64-w64-mingw32-gcc --version
+          aarch64-w64-mingw32-g++ --version
 
       - name: Set up JDK ${{ env.JAVA_VERSION }}
         uses: actions/setup-java@v5

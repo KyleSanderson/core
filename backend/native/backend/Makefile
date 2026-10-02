@@ -50,7 +50,7 @@ else ifeq ($(OS),Windows_NT)
 
 PLATFORMS := windows-amd64
 else
-PLATFORMS := linux-amd64 windows-amd64
+PLATFORMS := linux-amd64 windows-amd64 windows-arm64
 endif
 
 .PHONY: default desktop android build_all copy_to_resources clean

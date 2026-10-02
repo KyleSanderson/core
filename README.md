@@ -26,8 +26,7 @@ Install these before a source build.
 - `make`
 - Android SDK
 - Android NDK
-- C toolchain
-- MinGW-w64
+- C toolchain (Xcode Command Line Tools on macOS, GCC/Clang on Linux, MSVC or MinGW on Windows)
 - On Linux and macOS, `flock`
 
 Go toolchain is downloaded and patched.
