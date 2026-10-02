@@ -23,6 +23,12 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Install flock and GNU coreutils
+        run: |
+          brew tap discoteq/discoteq
+          brew install flock coreutils
+          echo "$(brew --prefix coreutils)/libexec/gnubin" >> "$GITHUB_PATH"
+
       - name: Set up JDK ${{ env.JAVA_VERSION }}
         uses: actions/setup-java@v5
         with:
