@@ -45,14 +45,28 @@ type windowsRouter struct {
 	rawLuid               uint64
 	originalSearchDomains []string
 
-	originalGateway netip.Addr
-	physicalLUID    winipcfg.LUID
+	originalGateway  netip.Addr
+	originalGateway6 netip.Addr
+	physicalLUID     winipcfg.LUID
+	physicalLUID6    winipcfg.LUID
+
+	// protectedEndpoints tracks the peer endpoint protection route currently installed for
+	// each destination, so stale entries (peer removed, endpoint changed, gateway changed,
+	// tunnel stopped) can be deleted instead of left behind in the routing table.
+	protectedEndpoints map[netip.Prefix]protectedEndpointRoute
 
 	physicalIfIndex uint32
 	notifyHandle    *winipcfg.InterfaceChangeCallback
 
 	ctx    context.Context
 	cancel context.CancelFunc
+}
+
+// protectedEndpointRoute is the interface/next-hop a peer endpoint protection route was
+// actually installed with, so it can be deleted precisely later without a fresh lookup.
+type protectedEndpointRoute struct {
+	luid    winipcfg.LUID
+	nextHop netip.Addr
 }
 
 func New(iface string, fw firewall.Firewall, tunnel tun.Device) (router.Router, error) {
@@ -62,14 +76,15 @@ func New(iface string, fw firewall.Firewall, tunnel tun.Device) (router.Router, 
 
 	ctx, cancel := context.WithCancel(context.Background())
 	r := &windowsRouter{
-		iface:       iface,
-		fw:          fw.(*osfirewall.WindowsFirewall),
-		v6Available: nettest.SupportsIPv6(),
-		nativeTun:   nativeTun,
-		rawLuid:     rawLuid,
-		luid:        winipcfg.LUID(rawLuid),
-		ctx:         ctx,
-		cancel:      cancel,
+		iface:              iface,
+		fw:                 fw.(*osfirewall.WindowsFirewall),
+		v6Available:        nettest.SupportsIPv6(),
+		nativeTun:          nativeTun,
+		rawLuid:            rawLuid,
+		luid:               winipcfg.LUID(rawLuid),
+		protectedEndpoints: make(map[netip.Prefix]protectedEndpointRoute),
+		ctx:                ctx,
+		cancel:             cancel,
 	}
 	r.notifyHandle, _ = winipcfg.RegisterInterfaceChangeCallback(r.onNetworkChange)
 	return r, nil
@@ -255,37 +270,80 @@ func (r *windowsRouter) configureInterface(cfg *router.Config) error {
 		log.Debug(tag, "**WARNING** failed to set private network: %v", err)
 	}
 
-	// redirect the physical interface on each call to Set
+	// redirect the physical interface on each call to Set. v4 and v6 are looked up and tracked
+	// separately.
 	r.originalGateway = netip.Addr{}
+	r.originalGateway6 = netip.Addr{}
 	r.physicalLUID = 0
+	r.physicalLUID6 = 0
 	r.physicalIfIndex = 0
-	physicalRoutes, _ := winipcfg.GetIPForwardTable2(windows.AF_INET)
-	for _, row := range physicalRoutes {
+	physicalRoutes4, _ := winipcfg.GetIPForwardTable2(windows.AF_INET)
+	for _, row := range physicalRoutes4 {
 		if row.DestinationPrefix.Prefix().Bits() == 0 && row.NextHop.Addr().IsValid() {
 			r.originalGateway = row.NextHop.Addr()
 			r.physicalLUID = row.InterfaceLUID
 			r.physicalIfIndex = row.InterfaceIndex
-			log.Debug(tag, "Detected physical gateway %v (LUID %d, Index %d) for peer endpoint protection", r.originalGateway, r.physicalLUID, r.physicalIfIndex)
+			log.Debug(tag, "Detected physical IPv4 gateway %v (LUID %d, Index %d) for peer endpoint protection", r.originalGateway, r.physicalLUID, r.physicalIfIndex)
+			break
+		}
+	}
+	physicalRoutes6, _ := winipcfg.GetIPForwardTable2(windows.AF_INET6)
+	for _, row := range physicalRoutes6 {
+		if row.DestinationPrefix.Prefix().Bits() == 0 && row.NextHop.Addr().IsValid() {
+			r.originalGateway6 = row.NextHop.Addr()
+			r.physicalLUID6 = row.InterfaceLUID
+			log.Debug(tag, "Detected physical IPv6 gateway %v (LUID %d) for peer endpoint protection", r.originalGateway6, r.physicalLUID6)
 			break
 		}
 	}
 
-	// protect peer public endpoints from routing loop by adding route to physical interface with metric 1 to take priority over the tunnel split-tunnel routes
+	// Protect peer public endpoints from the routing loop by adding a route via the physical
+	// interface with metric 1, taking priority over the tunnel's split-default routes. Routes
+	// are reconciled against what's currently installed so peers that are removed, change
+	// endpoint, or see their physical gateway change don't leave a stale route behind and so
+	// that closing the tunnel cleans all of them up.
+	wantedEndpoints := make(map[netip.Prefix]bool, len(cfg.PeerEndpoints))
 	for _, prefix := range cfg.PeerEndpoints {
 		if !prefix.IsValid() || prefix.Addr().IsPrivate() || prefix.Addr().IsLinkLocalUnicast() {
 			continue
 		}
+		wantedEndpoints[prefix] = true
 
-		if r.originalGateway.IsValid() && r.physicalLUID != 0 {
-			if err := r.physicalLUID.AddRoute(prefix, r.originalGateway, 1); err == nil {
-				log.Debug(tag, "Added protecting route for peer endpoint %v", prefix.Addr())
-				continue
+		gateway, physicalLUID := r.originalGateway, r.physicalLUID
+		if prefix.Addr().Is6() {
+			gateway, physicalLUID = r.originalGateway6, r.physicalLUID6
+		}
+		wantLUID, wantNextHop := physicalLUID, gateway
+		if !gateway.IsValid() || physicalLUID == 0 {
+			// fallback: no physical gateway detected for this family, route via the tunnel itself
+			wantLUID, wantNextHop = iface.LUID, netip.Addr{}
+		}
+
+		if existing, ok := r.protectedEndpoints[prefix]; ok {
+			if existing.luid == wantLUID && existing.nextHop == wantNextHop {
+				continue // already protected correctly
 			}
+			if err := existing.luid.DeleteRoute(prefix, existing.nextHop); err != nil {
+				log.Debug(tag, "Failed to remove outdated peer endpoint route %v: %v", prefix.Addr(), err)
+			}
+			delete(r.protectedEndpoints, prefix)
 		}
-		// fallback
-		if err := iface.LUID.AddRoute(prefix, netip.Addr{}, 1); err != nil {
+
+		if err := wantLUID.AddRoute(prefix, wantNextHop, 1); err != nil {
 			log.Error(tag, "Failed to add peer endpoint route %v: %v", prefix.Addr(), err)
+			continue
 		}
+		log.Debug(tag, "Added protecting route for peer endpoint %v", prefix.Addr())
+		r.protectedEndpoints[prefix] = protectedEndpointRoute{luid: wantLUID, nextHop: wantNextHop}
+	}
+	for prefix, pe := range r.protectedEndpoints {
+		if wantedEndpoints[prefix] {
+			continue
+		}
+		if err := pe.luid.DeleteRoute(prefix, pe.nextHop); err != nil {
+			log.Debug(tag, "Failed to remove stale peer endpoint route %v: %v", prefix.Addr(), err)
+		}
+		delete(r.protectedEndpoints, prefix)
 	}
 
 	ipif4, err := r.luid.IPInterface(windows.AF_INET)
