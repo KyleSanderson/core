@@ -7,6 +7,7 @@ import "C"
 import (
 	"context"
 	"net"
+	"net/netip"
 	"sync"
 
 	"github.com/amnezia-vpn/amneziawg-go/v3/device"
@@ -24,6 +25,10 @@ import (
 
 const tag = "ProxyBackend"
 
+// DefaultProxyDNS is used for netstack hostname resolution when the tunnel
+// config has no DNS servers (see startProxy).
+const DefaultProxyDNS = "1.1.1.1"
+
 var (
 	cancelFuncs          map[int32]context.CancelFunc
 	virtualTunnelHandles map[int32]*wireproxyawg.VirtualTun
@@ -35,10 +40,11 @@ func init() {
 	cancelFuncs = make(map[int32]context.CancelFunc)
 }
 
-//export startProxy
 // startProxy uses an already allocated handle so Kotlin can map status before start.
 // On failure the handle stays reserved — the caller must release it.
 // On success ownership transfers to the tunnel map and turnProxyTunnelOff releases it.
+//
+//export startProxy
 func startProxy(handle int32, ifName string, config string, uapiPath string, bypass int32, dnsConfig string) int32 {
 	if handle < 0 || !handlepkg.IsReserved(handle) {
 		log.Error(tag, "startProxy: invalid/unreserved handle %d", handle)
@@ -47,8 +53,37 @@ func startProxy(handle int32, ifName string, config string, uapiPath string, byp
 
 	conf, err := wireproxyawg.ParseConfigString(config)
 	if err != nil {
-		log.Error(tag, "Invalid config file", err)
+		log.Error(tag, "Invalid config file: %v", err)
 		return -1
+	}
+
+	// Proxy mode resolves hostnames inside the tunnel netstack, which requires
+	// DNS servers there (setting.DNS -> tnet.dnsServers). Without any, every
+	// hostname dial fails with the netstack's cryptic "cannot marshal DNS
+	// message" (its resolver returns a zero parser when the server list is
+	// empty). Configs without a DNS line are valid in VPN mode (the OS handles
+	// DNS), so inject a default resolver: with a tunnel DNS config the hijack
+	// engine answers regardless of destination; without one the query simply
+	// travels through the WireGuard tunnel to the public resolver.
+	if len(conf.Device.DNS) == 0 {
+		if defaultDNS, parseErr := netip.ParseAddr(DefaultProxyDNS); parseErr == nil {
+			conf.Device.DNS = append(conf.Device.DNS, defaultDNS)
+			log.Debug(tag, "No DNS in tunnel config; using %s for proxy hostname resolution", DefaultProxyDNS)
+		}
+	}
+
+	// Swap the fork's HTTP and SOCKS5 routines for Windows-compatible
+	// implementations. WinINET (Windows Internet Options) only speaks
+	// SOCKS4/4a, and the fork's HTTP proxy handles a single GET/CONNECT per
+	// connection and drops client keep-alive/pipelined data, which Windows
+	// surfaces as "connection closed".
+	for i, spawner := range conf.Routines {
+		switch routine := spawner.(type) {
+		case *wireproxyawg.HTTPConfig:
+			conf.Routines[i] = &httpProxySpawner{conf: routine}
+		case *wireproxyawg.Socks5Config:
+			conf.Routines[i] = &socksProxySpawner{conf: routine}
+		}
 	}
 
 	setting, err := wireproxyawg.CreateIPCRequest(conf.Device, false)
@@ -171,7 +206,7 @@ func updateProxyTunnelPeers(tunnelHandle int32, settings string) int32 {
 
 	conf, err := wireproxyawg.ParseConfigString(settings)
 	if err != nil {
-		log.Error(tag, "Invalid config file", err)
+		log.Error(tag, "Invalid config file: %v", err)
 		return -1
 	}
 
