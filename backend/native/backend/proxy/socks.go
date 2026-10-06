@@ -173,17 +173,6 @@ func (s *socksProxyServer) serveSocks4(conn net.Conn, br *bufio.Reader) {
 		host = rawIP.String()
 	}
 
-	if s.conf.Password != "" {
-		// SOCKS4 has no password field; fail closed rather than bypassing auth.
-		s.logger.Errorf("SOCKS4/4a request from %s rejected: password auth unsupported", conn.RemoteAddr())
-		reply(socks4RequestRejected)
-		return
-	}
-	if s.conf.Username != "" && string(userID) != s.conf.Username {
-		reply(socks4RequestRejected)
-		return
-	}
-
 	addr := net.JoinHostPort(host, strconv.Itoa(int(port)))
 	peer, err := s.vt.Tnet.Dial("tcp", addr)
 	if err != nil {
