@@ -9,6 +9,7 @@ import com.wgtunnel.backend.model.dns.DnsBootstrapResult
 import com.wgtunnel.backend.model.dns.TunnelDnsConfig
 import com.wgtunnel.backend.system.NetworkMonitor
 import com.wgtunnel.backend.util.PublicKey
+import com.wgtunnel.parser.Config
 import kotlin.time.Duration.Companion.milliseconds
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
@@ -27,9 +28,11 @@ internal class EndpointResolver(
     suspend fun resolve(
         mode: BackendMode,
         tunnelDnsConfig: TunnelDnsConfig? = null,
+        additionalConfigs: List<Config> = emptyList(),
     ): BootstrapResolution = coroutineScope {
-        val staticPeers = mode.config.peers.filter { it.isStaticallyConfigured }
-        val peersToResolve = mode.config.peers.filter { !it.isStaticallyConfigured }
+        val allPeers = mode.config.peers + additionalConfigs.flatMap { it.peers }
+        val staticPeers = allPeers.filter { it.isStaticallyConfigured }
+        val peersToResolve = allPeers.filter { !it.isStaticallyConfigured }
         val peerResults = mutableMapOf<PublicKey, DnsBootstrapResult>()
         val dnsNeedsResolve = tunnelDnsConfig?.needsResolve() == true
         var resolvedDns: TunnelDnsConfig? = if (dnsNeedsResolve) null else tunnelDnsConfig

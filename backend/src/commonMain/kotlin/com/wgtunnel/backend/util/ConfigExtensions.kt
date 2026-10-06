@@ -8,6 +8,9 @@ fun Config.hasDynamicEndpoints(): Boolean {
     return peers.any { !it.isStaticallyConfigured && it.endpoint != null }
 }
 
+internal fun Config.withResolvedEndpoints(hostMap: Map<PublicKey, ResolvedHost>): Config =
+    copy(peers = buildResolvedPeers(hostMap))
+
 internal fun Config.buildResolvedPeers(hostMap: Map<PublicKey, ResolvedHost>): List<PeerSection> {
     return this.peers.map { peer ->
         val resolved = hostMap[peer.publicKey] ?: return@map peer

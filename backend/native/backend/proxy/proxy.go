@@ -12,9 +12,9 @@ import (
 	"github.com/amnezia-vpn/amneziawg-go/v3/device"
 	"github.com/amnezia-vpn/amneziawg-go/v3/tun/netstack"
 	wireproxyawg "github.com/artem-russkikh/wireproxy-awg"
-	binder "github.com/wgtunnel/backend/bind"
 	"github.com/wgtunnel/backend/constants"
 	handlepkg "github.com/wgtunnel/backend/handle"
+	"github.com/wgtunnel/backend/hop"
 	"github.com/wgtunnel/backend/ipc"
 	"github.com/wgtunnel/backend/log"
 	"github.com/wgtunnel/backend/roaming"
@@ -35,11 +35,12 @@ func init() {
 	cancelFuncs = make(map[int32]context.CancelFunc)
 }
 
-//export startProxy
 // startProxy uses an already allocated handle so Kotlin can map status before start.
 // On failure the handle stays reserved — the caller must release it.
 // On success ownership transfers to the tunnel map and turnProxyTunnelOff releases it.
-func startProxy(handle int32, ifName string, config string, uapiPath string, bypass int32, dnsConfig string) int32 {
+//
+//export startProxy
+func startProxy(handle int32, ifName string, config string, uapiPath string, bypass int32, dnsConfig string, outerConfig string) int32 {
 	if handle < 0 || !handlepkg.IsReserved(handle) {
 		log.Error(tag, "startProxy: invalid/unreserved handle %d", handle)
 		return -1
@@ -50,6 +51,22 @@ func startProxy(handle int32, ifName string, config string, uapiPath string, byp
 		log.Error(tag, "Invalid config file", err)
 		return -1
 	}
+
+	outer, innerBind, err := hop.StartOuterIfSet(outerConfig, bypass == 1)
+	if err != nil {
+		log.Error(tag, "outer hop: %v", err)
+		return -1
+	}
+	if outer != nil {
+		hop.PermitUnderlayPeers(outerConfig)
+	}
+	outerAttached := false
+	defer func() {
+		if outer != nil && !outerAttached {
+			outer.Close()
+		}
+	}()
+	hop.AdjustInnerMTU(conf.Device, outer)
 
 	setting, err := wireproxyawg.CreateIPCRequest(conf.Device, false)
 	if err != nil {
@@ -81,8 +98,6 @@ func startProxy(handle int32, ifName string, config string, uapiPath string, byp
 		return -1
 	}
 
-	bind := binder.NewBind(bypass == 1)
-
 	statusCB := func(code device.StatusCode) {
 		// Serialized per tunnel, and skipped when Kotlin already applied this status.
 		statusnotify.Report(handle, int32(code))
@@ -90,7 +105,7 @@ func startProxy(handle int32, ifName string, config string, uapiPath string, byp
 
 	tunDevice := device.NewDevice(
 		deviceTUN,
-		bind,
+		innerBind,
 		log.WithTag("ProxyTun/"+ifName).DeviceLogger(),
 		statusCB,
 	)
@@ -155,7 +170,8 @@ func startProxy(handle int32, ifName string, config string, uapiPath string, byp
 	}
 
 	log.Debug(tag, "Started proxy tunnel for handle %d", handle)
-
+	hop.Attach(handle, outer)
+	outerAttached = true
 	return 0
 }
 
@@ -249,6 +265,7 @@ func turnProxyTunnelOff(virtualTunnelHandle int32) {
 	if virtualTun.Dev != nil {
 		virtualTun.Dev.Close()
 	}
+	hop.CloseAttached(virtualTunnelHandle)
 
 	statusnotify.Clear(virtualTunnelHandle)
 	handlepkg.ReleaseHandle(virtualTunnelHandle)

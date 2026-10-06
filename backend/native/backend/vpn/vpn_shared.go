@@ -14,10 +14,10 @@ import (
 	"github.com/amnezia-vpn/amneziawg-go/v3/device"
 	"github.com/amnezia-vpn/amneziawg-go/v3/tun"
 	wireproxyawg "github.com/artem-russkikh/wireproxy-awg"
-	"github.com/wgtunnel/backend/bind"
 	"github.com/wgtunnel/backend/bootstrap/bypass"
 	"github.com/wgtunnel/backend/constants"
 	hand "github.com/wgtunnel/backend/handle"
+	"github.com/wgtunnel/backend/hop"
 	"github.com/wgtunnel/backend/ipc"
 	"github.com/wgtunnel/backend/log"
 	"github.com/wgtunnel/backend/roaming"
@@ -47,6 +47,7 @@ func startVpnDevice(
 	settings string,
 	dnsConfigJSON string,
 	uapiPath string,
+	outerConfig string,
 ) int32 {
 	if tunHandle < 0 || !hand.IsReserved(tunHandle) {
 		log.Error(tag, "startVpnDevice: invalid/unreserved handle %d", tunHandle)
@@ -69,6 +70,20 @@ func startVpnDevice(
 		return -1
 	}
 
+	outer, innerBind, err := hop.StartOuterIfSet(outerConfig, true)
+	if err != nil {
+		log.Error(tag, "outer hop: %v", err)
+		tun.Close()
+		return -1
+	}
+	outerAttached := false
+	defer func() {
+		if outer != nil && !outerAttached {
+			outer.Close()
+		}
+	}()
+	hop.AdjustInnerMTU(conf.Device, outer)
+
 	statusCB := func(code device.StatusCode) {
 		// Serialized per tunnel, and skipped when Kotlin already applied this status.
 		statusnotify.Report(tunHandle, int32(code))
@@ -76,8 +91,7 @@ func startVpnDevice(
 
 	tunDevice := device.NewDevice(
 		tun,
-		// VPN mode always needs the socket protected on Android, other platforms ignore this flag
-		bind.NewBind(true),
+		innerBind,
 		log.WithTag("VpnTun/"+interfaceName).DeviceLogger(),
 		statusCB,
 	)
@@ -90,7 +104,7 @@ func startVpnDevice(
 		tunDevice.Close()
 		return -1
 	}
-	
+
 	if err := tunDevice.IpcSet(ipcRequest.IpcRequest); err != nil {
 		log.Error(tag, "IpcSet: %v", err)
 		tunDevice.Close()
@@ -131,6 +145,8 @@ func startVpnDevice(
 	tunnelMu.Lock()
 	tunnelHandles[tunHandle] = TunnelHandle{device: tunDevice, uapi: uapi}
 	tunnelMu.Unlock()
+	hop.Attach(tunHandle, outer)
+	outerAttached = true
 	return 0
 }
 
@@ -185,6 +201,7 @@ func stopVpn(handle int32) {
 	if tunHandle.device != nil {
 		tunHandle.device.Close()
 	}
+	hop.CloseAttached(handle)
 	bypass.SetTunnelInterfaceIndex(0)
 	statusnotify.Clear(handle)
 	hand.ReleaseHandle(handle)

@@ -6,6 +6,7 @@ import com.wgtunnel.backend.model.KillSwitchConfig
 import com.wgtunnel.backend.model.dns.DnsBoostrapMode
 import com.wgtunnel.backend.model.dns.TunnelDnsConfig
 import com.wgtunnel.backend.state.BackendStatus
+import com.wgtunnel.parser.Config
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.StateFlow
 
@@ -17,6 +18,7 @@ interface Backend {
         tunnel: Tunnel,
         mode: BackendMode,
         tunnelDnsConfig: TunnelDnsConfig? = null,
+        outerConfig: Config? = null,
     ): Result<Unit>
 
     suspend fun stop(id: Int): Result<Unit>

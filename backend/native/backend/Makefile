@@ -9,7 +9,7 @@ DESTDIR ?= $(CURDIR)/out
 # Gradle overrides this to src/jvmMain/resources/natives
 RESOURCEDIR ?= $(CURDIR)/../../src/jvmMain/resources/natives
 
-# Linux/Android nanotime is patched to CLOCK_BOOTTIME
+# nanotime: Linux/Android CLOCK_BOOTTIME; Darwin mach_continuous_time
 GO_VERSION := 1.27.0
 GO_DIR := $(BUILDDIR)/go-$(GO_VERSION)
 GRADLE_USER_HOME ?= $(HOME)/.gradle
@@ -50,7 +50,7 @@ else ifeq ($(OS),Windows_NT)
 
 PLATFORMS := windows-amd64
 else
-PLATFORMS := linux-amd64 windows-amd64 windows-arm64
+PLATFORMS := linux-amd64 windows-amd64
 endif
 
 .PHONY: default desktop android build_all copy_to_resources clean
@@ -77,12 +77,14 @@ $(GRADLE_USER_HOME)/caches/golang/$(GO_TARBALL):
 	mv "$@.tmp" "$@"'
 
 $(GO_DIR)/.prepared: $(GRADLE_USER_HOME)/caches/golang/$(GO_TARBALL) \
-		$(CURDIR)/goruntime-boottime-over-monotonic.diff
+		$(CURDIR)/goruntime-boottime-over-monotonic.diff \
+		$(CURDIR)/goruntime-darwin-continuous-time.diff
 	mkdir -p "$(dir $@)"
 	SHELL=/bin/bash flock "$@.lock" -c ' \
 	[ -f "$@" ] && exit 0; \
 	tar -C "$(dir $@)" --strip-components=1 -xzf "$<" && \
 	patch -p1 -N -d "$(dir $@)" < "$(CURDIR)/goruntime-boottime-over-monotonic.diff" && \
+	patch -p1 -N -d "$(dir $@)" < "$(CURDIR)/goruntime-darwin-continuous-time.diff" && \
 	find "$(dir $@)pkg" -mindepth 1 -maxdepth 1 -type d -name "linux_*" -exec rm -rf {} +; \
 	touch "$@"'
 
@@ -137,16 +139,6 @@ $(DESTDIR)/libwg-windows-amd64.dll: $(GO_DIR)/.prepared
 		-o "$@" -buildmode=c-shared .
 endif
 
-$(DESTDIR)/libwg-windows-arm64.dll: $(GO_DIR)/.prepared
-	@mkdir -p "$(DESTDIR)"
-	$(PATCHED_GO) \
-	CGO_ENABLED=1 CGO_CFLAGS='$(DESKTOP_CGO_CFLAGS)' \
-	CGO_LDFLAGS="-Wl,--export-all-symbols" \
-	GOOS=windows GOARCH=arm64 \
-	CC=aarch64-w64-mingw32-gcc CXX=aarch64-w64-mingw32-g++ \
-	go build -tags 'notest,cgo' -ldflags="-buildid=" -trimpath -buildvcs=false \
-		-o "$@" -buildmode=c-shared .
-
 $(DESTDIR)/libwg-darwin-amd64.dylib: $(GO_DIR)/.prepared
 	@mkdir -p "$(DESTDIR)"
 	$(PATCHED_GO) \
@@ -174,7 +166,6 @@ copy_to_resources: build_all
 		subdir=; \
 		if [ "$$os" = "linux" ] && [ "$$arch" = "amd64" ]; then subdir=linux-x64; fi; \
 		if [ "$$os" = "windows" ] && [ "$$arch" = "amd64" ]; then subdir=win32-x64; fi; \
-		if [ "$$os" = "windows" ] && [ "$$arch" = "arm64" ]; then subdir=win32-aarch64; fi; \
 		if [ "$$os" = "darwin" ] && [ "$$arch" = "amd64" ]; then subdir=darwin-x64; fi; \
 		if [ "$$os" = "darwin" ] && [ "$$arch" = "arm64" ]; then subdir=darwin-aarch64; fi; \
 		libext=so; \

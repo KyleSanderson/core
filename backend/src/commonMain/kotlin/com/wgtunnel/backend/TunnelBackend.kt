@@ -16,6 +16,7 @@ import com.wgtunnel.backend.model.EngineStartResult
 import com.wgtunnel.backend.model.KillSwitchConfig
 import com.wgtunnel.backend.model.dns.BootstrapResolution
 import com.wgtunnel.backend.model.dns.DnsBoostrapMode
+import com.wgtunnel.backend.model.dns.ResolvedHost
 import com.wgtunnel.backend.model.dns.TunnelDnsConfig
 import com.wgtunnel.backend.service.RuntimeManager
 import com.wgtunnel.backend.shell.ShellExecutor
@@ -25,11 +26,14 @@ import com.wgtunnel.backend.state.BootstrapState
 import com.wgtunnel.backend.state.KillSwitchState
 import com.wgtunnel.backend.system.NetworkMonitor
 import com.wgtunnel.backend.system.PowerManager
+import com.wgtunnel.backend.util.PublicKey
 import com.wgtunnel.backend.util.hasDynamicEndpoints
 import com.wgtunnel.backend.util.hasIpv6Peers
 import com.wgtunnel.backend.util.rebuildModeWithHostMap
 import com.wgtunnel.backend.util.withEndpointsFrom
+import com.wgtunnel.backend.util.withResolvedEndpoints
 import com.wgtunnel.parser.ActiveConfig
+import com.wgtunnel.parser.Config
 import com.wgtunnel.parser.PeerSection
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.time.Duration
@@ -146,6 +150,7 @@ class TunnelBackend(
         tunnel: Tunnel,
         mode: BackendMode,
         tunnelDnsConfig: TunnelDnsConfig?,
+        outerConfig: Config?,
     ): Result<Unit> = tunnelMutex.withLock {
         runCatching {
             if (_status.value.activeTunnels.containsKey(tunnel.id)) {
@@ -160,6 +165,7 @@ class TunnelBackend(
                     transportState = Tunnel.State.Starting,
                     mode = mode,
                     tunnelDnsConfig = tunnelDnsConfig,
+                    outerConfig = outerConfig,
                 ),
             )
             applicationProvider.refreshStatusUi()
@@ -172,11 +178,11 @@ class TunnelBackend(
 
             setupServicesAndProtectorForMode(tunnel, mode, useFakeDns)
 
-            if (needsBootstrap(mode, tunnelDnsConfig)) {
+            if (needsBootstrap(mode, tunnelDnsConfig, outerConfig)) {
                 pendingResolutionJobs[tunnel.id] =
-                    startTunnelBootstrapJob(tunnel, mode, tunnelDnsConfig)
+                    startTunnelBootstrapJob(tunnel, mode, tunnelDnsConfig, outerConfig)
             } else {
-                startEngineAndRegister(tunnel.id, mode, tunnelDnsConfig)
+                startEngineAndRegister(tunnel.id, mode, tunnelDnsConfig, outerConfig = outerConfig)
                 if (scriptsEnabled) {
                     mode.config.`interface`.postUp?.let { runScripts(it, tunnel.id) }
                 }
@@ -191,6 +197,7 @@ class TunnelBackend(
         mode: BackendMode,
         tunnelDnsConfig: TunnelDnsConfig?,
         destroyRuntimeOnFailure: Boolean = true,
+        outerConfig: Config? = null,
     ): EngineStartResult =
         withContext(NonCancellable) {
             val handle = allocateTunnelHandle()
@@ -222,6 +229,7 @@ class TunnelBackend(
                         mode,
                         killSwitchStampedDnsConfig,
                         destroyRuntimeOnFailure,
+                        outerConfig,
                     )
                 nativeOwnedHandles.add(handle)
                 updateActiveTunnel(tunnelId) {
@@ -251,6 +259,7 @@ class TunnelBackend(
         tunnel: Tunnel,
         mode: BackendMode,
         tunnelDnsConfig: TunnelDnsConfig? = null,
+        outerConfig: Config? = null,
     ) {
         updateTunnelBootstrapState(tunnel.id, BootstrapState.ResolvingDns)
         log.i {
@@ -258,7 +267,8 @@ class TunnelBackend(
                 "before TurnOn"
         }
 
-        val bootstrapResolution = endpointResolver.resolve(mode, tunnelDnsConfig)
+        val bootstrapResolution =
+            endpointResolver.resolve(mode, tunnelDnsConfig, listOfNotNull(outerConfig))
 
         // select peer endpoint IP family based on network state and preference
         val networkHasIpv6 = networkMonitor.networkState.value?.hasIpv6 ?: false
@@ -281,6 +291,7 @@ class TunnelBackend(
                 networkHasIpv6 = networkHasIpv6,
             )
         val runtimeMode = mode.rebuildModeWithHostMap(hostMap)
+        val runtimeOuter = outerConfig?.withResolvedEndpoints(hostMap)
         mode.config.peers.forEach { peer ->
             val chosen = runtimeMode.config.peers.firstOrNull { it.publicKey == peer.publicKey }
             val resolved = hostMap[peer.publicKey]
@@ -302,7 +313,12 @@ class TunnelBackend(
 
         log.i { "VPN: bootstrap complete, bringing tunnel up (TurnOn) for ${tunnel.name}" }
         // pass our bootstrapped tunnel dns config
-        startEngineAndRegister(tunnel.id, runtimeMode, bootstrapResolution.resolvedTunnelDnsConfig)
+        startEngineAndRegister(
+            tunnel.id,
+            runtimeMode,
+            bootstrapResolution.resolvedTunnelDnsConfig,
+            outerConfig = runtimeOuter,
+        )
     }
 
     // Desktop TurnOn consumes a pending iface created before bootstrap. Stop
@@ -320,7 +336,7 @@ class TunnelBackend(
         mode: BackendMode,
         dns: TunnelDnsConfig?,
     ): Boolean {
-        restartDevice(handle, tunnel, mode, mode, dns)
+        restartDevice(handle, tunnel, mode, mode, dns, outerConfig = activeOuterConfig(tunnel.id))
         return true
     }
 
@@ -331,10 +347,29 @@ class TunnelBackend(
         stopMode: BackendMode,
         runtimeMode: BackendMode,
         dns: TunnelDnsConfig?,
+        outerConfig: Config? = null,
     ) {
         stopNativeKeepMapped(handle, stopMode)
         recreateVpnInterfaceIfNeeded(tunnel, runtimeMode)
-        startEngineAndRegister(tunnel.id, runtimeMode, dns, destroyRuntimeOnFailure = false)
+        startEngineAndRegister(
+            tunnel.id,
+            runtimeMode,
+            dns,
+            destroyRuntimeOnFailure = false,
+            outerConfig = outerConfig,
+        )
+    }
+
+    private fun activeOuterConfig(tunnelId: Int): Config? =
+        _status.value.activeTunnels[tunnelId]?.outerConfig
+
+    private fun resolvedOuterConfig(
+        tunnelId: Int,
+        hostMap: Map<PublicKey, ResolvedHost>?,
+    ): Config? {
+        val outer = activeOuterConfig(tunnelId) ?: return null
+        if (hostMap.isNullOrEmpty()) return outer
+        return outer.withResolvedEndpoints(hostMap)
     }
 
     /** Stop native tunnel and drop ownership; keep Kotlin maps until re-register. */
@@ -361,7 +396,19 @@ class TunnelBackend(
                 }
 
         val runtimeMode = mode.withEndpointsFrom(activeConfig)
-        restartDevice(handle, tunnel, mode, runtimeMode, tunnelDnsConfig)
+        val previous = _status.value.activeTunnels[tunnel.id]?.lastBootstrapResolution
+        val hostMap =
+            previous?.toHostMap(
+                networkHasIpv6 = networkMonitor.networkState.value?.hasIpv6 ?: false
+            )
+        restartDevice(
+            handle,
+            tunnel,
+            mode,
+            runtimeMode,
+            tunnelDnsConfig,
+            outerConfig = resolvedOuterConfig(tunnel.id, hostMap),
+        )
         return true
     }
 
@@ -375,7 +422,11 @@ class TunnelBackend(
             try {
                 withTimeout(10.seconds) {
                     // reuse the cached resolve tunnelDnsConfig
-                    endpointResolver.resolve(mode, tunnelDnsConfig)
+                    endpointResolver.resolve(
+                        mode,
+                        tunnelDnsConfig,
+                        listOfNotNull(activeOuterConfig(tunnel.id)),
+                    )
                 }
             } catch (_: TimeoutCancellationException) {
                 log.w { "Bounce DNS timed out for tunnel ${tunnel.name}, bounce failed" }
@@ -421,7 +472,14 @@ class TunnelBackend(
             )
         }
 
-        restartDevice(handle, tunnel, mode, runtimeMode, mergedResolution.resolvedTunnelDnsConfig)
+        restartDevice(
+            handle,
+            tunnel,
+            mode,
+            runtimeMode,
+            mergedResolution.resolvedTunnelDnsConfig,
+            outerConfig = resolvedOuterConfig(tunnel.id, hostMap),
+        )
         return true
     }
 
@@ -443,7 +501,8 @@ class TunnelBackend(
 
             return try {
                 when {
-                    !mode.config.hasDynamicEndpoints() -> {
+                    !mode.config.hasDynamicEndpoints() &&
+                        active.outerConfig?.hasDynamicEndpoints() != true -> {
                         restartWithCurrentMode(handle, tunnel, mode, runtimeTunnelDnsConfig)
                     }
                     !withFreshResolution -> {
@@ -475,10 +534,11 @@ class TunnelBackend(
         tunnel: Tunnel,
         mode: BackendMode,
         tunnelDnsConfig: TunnelDnsConfig? = null,
+        outerConfig: Config? = null,
     ): Job {
         val job = scope.launch {
             try {
-                bootstrapAndStart(tunnel, mode, tunnelDnsConfig)
+                bootstrapAndStart(tunnel, mode, tunnelDnsConfig, outerConfig)
                 val scriptsEnabled = tunnel.scriptsEnabled
                 if (scriptsEnabled) {
                     mode.config.`interface`.postUp?.let { runScripts(it, tunnel.id) }
@@ -744,8 +804,14 @@ class TunnelBackend(
         }
     }
 
-    private fun needsBootstrap(mode: BackendMode, cfg: TunnelDnsConfig?): Boolean =
-        mode.config.hasDynamicEndpoints() || (cfg?.needsResolve() == true)
+    private fun needsBootstrap(
+        mode: BackendMode,
+        cfg: TunnelDnsConfig?,
+        outerConfig: Config? = null,
+    ): Boolean =
+        mode.config.hasDynamicEndpoints() ||
+            (outerConfig?.hasDynamicEndpoints() == true) ||
+            (cfg?.needsResolve() == true)
 
     fun updateTunnelBootstrapState(id: Int, newState: BootstrapState) {
         updateActiveTunnel(id) { tunnel -> tunnel.copy(bootstrapState = newState) }
@@ -755,7 +821,9 @@ class TunnelBackend(
         active: ActiveTunnel,
         mode: BackendMode,
     ): Tunnel.Feature.Recovery {
-        val hasDynamicEndpoints = mode.config.hasDynamicEndpoints()
+        val hasDynamicEndpoints =
+            mode.config.hasDynamicEndpoints() ||
+                (active.outerConfig?.hasDynamicEndpoints() == true)
         val feature =
             active.tunnel?.features?.filterIsInstance<Tunnel.Feature.Recovery>()?.firstOrNull()
                 ?: TunnelRecovery.IDLE_RECOVERY
