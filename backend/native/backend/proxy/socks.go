@@ -147,8 +147,10 @@ func (s *socksProxyServer) serveSocks4(conn net.Conn, br *bufio.Reader) {
 	port := binary.BigEndian.Uint16(header[2:4])
 	rawIP := net.IP(header[4:8])
 
-	userID, err := readSocks4Field(br)
-	if err != nil {
+	// The userid field carries no credential the shared proxy configuration
+	// could check (SOCKS4 has no password support at all), but it must still
+	// be consumed for framing before the optional 4a hostname.
+	if _, err := readSocks4Field(br); err != nil {
 		return
 	}
 
