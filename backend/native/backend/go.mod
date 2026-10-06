@@ -10,6 +10,7 @@ require (
 	github.com/mdlayher/wifi v0.9.0
 	github.com/miekg/dns v1.1.72
 	github.com/tailscale/wf v0.0.0-20240214030419-6fbb0a674ee6
+	github.com/things-go/go-socks5 v0.1.0
 	github.com/vishvananda/netlink v1.3.1
 	go4.org/netipx v0.0.0-20231129151722-fdeea329fbba
 	golang.org/x/net v0.57.0
@@ -28,7 +29,6 @@ require (
 	github.com/mdlayher/genetlink v1.4.0 // indirect
 	github.com/mdlayher/netlink v1.11.2 // indirect
 	github.com/mdlayher/socket v0.6.0 // indirect
-	github.com/things-go/go-socks5 v0.1.0 // indirect
 	github.com/vishvananda/netns v0.0.5 // indirect
 	golang.org/x/crypto v0.54.0 // indirect
 	golang.org/x/exp v0.0.0-20260410095643-746e56fc9e2f // indirect
@@ -41,7 +41,8 @@ require (
 	honnef.co/go/tools v0.7.0 // indirect
 )
 
-replace github.com/amnezia-vpn/amneziawg-go/v3 => github.com/wgtunnel/amneziawg-go/v3 v3.0.0-20260926105223-c434976f60d4
+replace github.com/amnezia-vpn/amneziawg-go/v3 => /home/lamar/amneziawg-go
+// replace github.com/amnezia-vpn/amneziawg-go/v3 => github.com/wgtunnel/amneziawg-go/v3 v3.0.0-20260926105223-c434976f60d4
 
 // replace github.com/amnezia-vpn/amneziawg-go/v3 => ../../../../amneziawg-go
 
