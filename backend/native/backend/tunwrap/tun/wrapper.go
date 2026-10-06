@@ -438,15 +438,34 @@ func (f *WrapperTUN) resolveAndReply(orig *parsedPacket) {
 }
 
 func (f *WrapperTUN) writeDNSResponse(orig *parsedPacket, resp *dns.Msg, name string) {
+	mtu, err := f.realTUN.MTU()
+	if err != nil || mtu <= 0 {
+		mtu = 1280
+	}
+
+	// Largest DNS payload that fits in a single unfragmented packet.
+	// buildDNSResponse cuts anything larger mid-record, which produces
+	// malformed DNS no client can parse — so truncate properly first,
+	// per RFC 2181 §9: keep the question, drop answers, set the TC bit so
+	// the client retries over TCP.
+	maxPayload := mtu - 28 // IPv4: 20 (IP header) + 8 (UDP header)
+	if orig.IPVersion == 6 {
+		maxPayload = mtu - 48 // IPv6: 40 (IP header) + 8 (UDP header)
+	}
+
 	respBytes, err := resp.Pack()
 	if err != nil {
 		log.Error(tag, "dns: pack %s: %v", name, err)
 		return
 	}
-
-	mtu, err := f.realTUN.MTU()
-	if err != nil || mtu <= 0 {
-		mtu = 1280
+	if len(respBytes) > maxPayload {
+		resp.Truncate(maxPayload)
+		respBytes, err = resp.Pack()
+		if err != nil {
+			log.Error(tag, "dns: pack truncated %s: %v", name, err)
+			return
+		}
+		log.Debug(tag, "dns: reply name=%s truncated to %d bytes (TC set)", name, len(respBytes))
 	}
 
 	outPacket, err := buildDNSResponse(orig, respBytes, mtu)
