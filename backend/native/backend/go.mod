@@ -16,6 +16,7 @@ require (
 	golang.org/x/sync v0.22.0
 	golang.org/x/sys v0.47.0
 	golang.zx2c4.com/wireguard/windows v1.0.1
+	gvisor.dev/gvisor v0.0.0-20260224225140-573d5e7127a8
 	howett.net/plist v1.0.1
 )
 
@@ -37,7 +38,6 @@ require (
 	golang.org/x/time v0.15.0 // indirect
 	golang.org/x/tools v0.47.0 // indirect
 	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2 // indirect
-	gvisor.dev/gvisor v0.0.0-20260224225140-573d5e7127a8 // indirect
 	honnef.co/go/tools v0.7.0 // indirect
 )
 
@@ -45,4 +45,4 @@ replace github.com/amnezia-vpn/amneziawg-go/v3 => github.com/wgtunnel/amneziawg-
 
 // replace github.com/amnezia-vpn/amneziawg-go/v3 => ../../../../amneziawg-go
 
-replace github.com/artem-russkikh/wireproxy-awg => github.com/wgtunnel/wireproxy-awg v0.0.0-20260826164303-3bce9f3e3fb2
+replace github.com/artem-russkikh/wireproxy-awg => github.com/wgtunnel/wireproxy-awg v0.0.0-20261006070100-f4e329d56b6b
