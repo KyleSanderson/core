@@ -8,6 +8,7 @@ internal object ProxyBackend {
         uapiPath: String,
         bypass: Int,
         dnsConfigJson: String?,
+        outerConfig: String?,
     ): Int
 
     external fun updateProxyTunnelPeers(handle: Int, settings: String): Int

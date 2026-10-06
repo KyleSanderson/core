@@ -4,6 +4,7 @@ import com.wgtunnel.backend.model.BackendMode
 import com.wgtunnel.backend.model.EngineStartResult
 import com.wgtunnel.backend.model.dns.TunnelDnsConfig
 import com.wgtunnel.parser.ActiveConfig
+import com.wgtunnel.parser.Config
 import com.wgtunnel.parser.PeerSection
 
 internal interface TunnelEngine {
@@ -15,6 +16,7 @@ internal interface TunnelEngine {
         // A failed start normally destroys the VPN runtime. A bounce keeps it so a failure can't
         // take down the interface that protects the user.
         destroyRuntimeOnFailure: Boolean = true,
+        outerConfig: Config? = null,
     ): EngineStartResult
 
     suspend fun stop(handle: Int, mode: BackendMode)

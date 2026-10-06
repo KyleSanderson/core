@@ -191,12 +191,14 @@ func startVpn(
 	config string,
 	dnsConfig string,
 	uapiPath string,
+	outerConfig string,
 ) int32 {
 
 	ifName = strings.Clone(ifName)
 	config = strings.Clone(config)
 	dnsConfig = strings.Clone(dnsConfig)
 	uapiPath = strings.Clone(uapiPath)
+	outerConfig = strings.Clone(outerConfig)
 
 	tunDev, rt, err := takePending(ifName)
 	if err != nil {
@@ -204,7 +206,17 @@ func startVpn(
 		return -1
 	}
 
-	rc := startVpnDevice(handle, ifName, tunDev, config, dnsConfig, uapiPath)
+	if rt != nil {
+		if conf, err := wireproxyawg.ParseConfigString(config); err == nil {
+			if cfg, err := parseToRouterConfig(conf, 0); err == nil {
+				applyFakeDNSOverride(cfg, dnsConfig)
+				mergeOuterPeerEndpoints(cfg, outerConfig)
+				_ = rt.Set(cfg)
+			}
+		}
+	}
+
+	rc := startVpnDevice(handle, ifName, tunDev, config, dnsConfig, uapiPath, outerConfig)
 	if rc < 0 {
 		if rt != nil {
 			_ = rt.Close()
@@ -214,13 +226,6 @@ func startVpn(
 		}
 		removeStaleTun(ifName)
 		return -1
-	}
-
-	if conf, err := wireproxyawg.ParseConfigString(config); err == nil {
-		if cfg, err := parseToRouterConfig(conf, 0); err == nil && rt != nil {
-			applyFakeDNSOverride(cfg, dnsConfig)
-			_ = rt.Set(cfg)
-		}
 	}
 
 	desktopMu.Lock()
@@ -260,6 +265,24 @@ func applyFakeDNSOverride(cfg *router.Config, dnsConfigJSON string) {
 	if len(fake) > 0 {
 		cfg.DNS = fake
 	}
+}
+
+// mergeOuterPeerEndpoints replaces inner peer host-routes with the outer hop's
+// endpoints.
+func mergeOuterPeerEndpoints(cfg *router.Config, outerConfig string) {
+	if cfg == nil || strings.TrimSpace(outerConfig) == "" {
+		return
+	}
+	oconf, err := wireproxyawg.ParseConfigString(outerConfig)
+	if err != nil {
+		log.Debug(tag, "outer hop router merge parse: %v", err)
+		return
+	}
+	ocfg, err := parseToRouterConfig(oconf, 0)
+	if err != nil {
+		return
+	}
+	cfg.PeerEndpoints = ocfg.PeerEndpoints
 }
 
 func parseToRouterConfig(conf *wireproxyawg.Configuration, listenPort uint16) (*router.Config, error) {

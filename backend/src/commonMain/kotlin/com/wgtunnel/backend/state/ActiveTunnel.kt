@@ -5,6 +5,7 @@ import com.wgtunnel.backend.model.BackendMode
 import com.wgtunnel.backend.model.dns.BootstrapResolution
 import com.wgtunnel.backend.model.dns.TunnelDnsConfig
 import com.wgtunnel.parser.ActiveConfig
+import com.wgtunnel.parser.Config
 
 data class ActiveTunnel(
     val tunnel: Tunnel? = null,
@@ -20,6 +21,7 @@ data class ActiveTunnel(
     val lastStatsAtMs: Long = 0L,
     val tunnelDnsConfig: TunnelDnsConfig? = null,
     val lastBootstrapResolution: BootstrapResolution? = null,
+    val outerConfig: Config? = null,
 ) {
     fun getRuntimeTunnelDnsConfig(): TunnelDnsConfig? {
         return lastBootstrapResolution?.resolvedTunnelDnsConfig ?: tunnelDnsConfig

@@ -9,7 +9,7 @@ extern char *getVpnConfig(int handle);
 extern char *version(void);
 extern int startVpn(int handle, struct go_string ifname, int tun_fd,
                   struct go_string config, struct go_string dnsconfig,
-                  struct go_string uapipath);
+                  struct go_string uapipath, struct go_string outerconfig);
 extern int updateVpnTunnelPeers(int handle, struct go_string config);
 extern int32_t allocateTunnelHandle(void);
 extern void releaseTunnelHandle(int32_t handle);
@@ -208,10 +208,10 @@ JNIEXPORT jint JNICALL
 Java_com_wgtunnel_backend_VpnBackend_turnOn(
         JNIEnv *env, jclass c,
         jint handle, jstring ifname, jint tun_fd, jstring settings,
-        jstring dnsConfigJson, jstring uapiPath)
+        jstring dnsConfigJson, jstring uapiPath, jstring outerConfig)
 {
-    const char *if_p = NULL, *set_p = NULL, *dns_p = NULL, *uapi_p = NULL;
-    struct go_string if_g, set_g, dns_g, uapi_g;
+    const char *if_p = NULL, *set_p = NULL, *dns_p = NULL, *uapi_p = NULL, *outer_p = NULL;
+    struct go_string if_g, set_g, dns_g, uapi_g, outer_g;
     int ret;
     (void)c;
 
@@ -219,13 +219,15 @@ Java_com_wgtunnel_backend_VpnBackend_turnOn(
     set_g = jstring_to_go(env, settings, &set_p);
     dns_g = jstring_to_go(env, dnsConfigJson, &dns_p);
     uapi_g = jstring_to_go(env, uapiPath, &uapi_p);
+    outer_g = jstring_to_go(env, outerConfig, &outer_p);
 
-    ret = startVpn((int)handle, if_g, (int)tun_fd, set_g, dns_g, uapi_g);
+    ret = startVpn((int)handle, if_g, (int)tun_fd, set_g, dns_g, uapi_g, outer_g);
 
     release_jstring(env, ifname, if_p);
     release_jstring(env, settings, set_p);
     release_jstring(env, dnsConfigJson, dns_p);
     release_jstring(env, uapiPath, uapi_p);
+    release_jstring(env, outerConfig, outer_p);
     return (jint)ret;
 }
 

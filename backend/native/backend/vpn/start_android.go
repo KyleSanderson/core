@@ -17,6 +17,7 @@ func startVpn(
 	config string,
 	dnsConfig string,
 	uapiPath string,
+	outerConfig string,
 ) int32 {
 	realTUN, name, err := tun.CreateUnmonitoredTUNFromFD(int(tunFd))
 	if err != nil {
@@ -32,6 +33,7 @@ func startVpn(
 		config,
 		dnsConfig,
 		uapiPath,
+		outerConfig,
 	)
 }
 

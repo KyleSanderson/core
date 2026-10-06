@@ -29,10 +29,16 @@ internal class WireGuardTunnelEngine(private val runtimeManager: RuntimeManager)
         mode: BackendMode,
         tunnelDnsConfig: TunnelDnsConfig?,
         destroyRuntimeOnFailure: Boolean,
+        outerConfig: Config?,
     ): EngineStartResult {
         val ifName = interfacePrefix() + tunnelId
 
-        mode.config.`interface`.listenPort?.let { PortUtils.waitForUdpPortAvailable(it) }
+        // Only the physical hop binds a host UDP port. Inner NetstackBind has none.
+        val physicalListen =
+            if (outerConfig != null) outerConfig.`interface`.listenPort
+            else mode.config.`interface`.listenPort
+        physicalListen?.let { PortUtils.waitForUdpPortAvailable(it) }
+        val outerQuick = outerConfig?.asQuickString()
 
         val runtimeDnsConfig =
             tunnelDnsConfig
@@ -62,6 +68,7 @@ internal class WireGuardTunnelEngine(private val runtimeManager: RuntimeManager)
                     proxyConfig,
                     withBridge = true,
                     dnsJson,
+                    outerQuick,
                 )
             }
             is BackendMode.Proxy.Standard -> {
@@ -88,6 +95,7 @@ internal class WireGuardTunnelEngine(private val runtimeManager: RuntimeManager)
                     mode.proxyConfig,
                     withBridge = false,
                     dnsJson,
+                    outerQuick,
                 )
             }
             is BackendMode.Vpn ->
@@ -98,6 +106,7 @@ internal class WireGuardTunnelEngine(private val runtimeManager: RuntimeManager)
                     mode.config,
                     dnsJson,
                     destroyRuntimeOnFailure,
+                    outerQuick,
                 )
         }
 
@@ -145,6 +154,7 @@ internal class WireGuardTunnelEngine(private val runtimeManager: RuntimeManager)
         config: Config,
         dnsConfigJson: String?,
         destroyRuntimeOnFailure: Boolean,
+        outerQuick: String?,
     ) {
         runtimeManager.getOrCreateVpnRuntime()
         val tunFd =
@@ -162,6 +172,7 @@ internal class WireGuardTunnelEngine(private val runtimeManager: RuntimeManager)
                 config.asQuickString(),
                 dnsConfigJson,
                 runtimeManager.uapiPath,
+                outerQuick,
             )
         if (rc < 0) {
             if (destroyRuntimeOnFailure) {
@@ -178,6 +189,7 @@ internal class WireGuardTunnelEngine(private val runtimeManager: RuntimeManager)
         proxyConfig: ProxyConfig,
         withBridge: Boolean,
         dnsConfigJson: String?,
+        outerQuick: String?,
     ) {
         val quickConfig = buildProxiedQuickString(config, proxyConfig)
         val rc =
@@ -188,6 +200,7 @@ internal class WireGuardTunnelEngine(private val runtimeManager: RuntimeManager)
                 runtimeManager.uapiPath,
                 if (withBridge) 1 else 0,
                 dnsConfigJson,
+                outerQuick,
             )
         if (rc < 0) {
             throw BackendException.InternalError("Internal native error")

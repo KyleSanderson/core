@@ -5,7 +5,8 @@
 
 extern int32_t startProxy(int32_t handle, struct go_string ifName,
                           struct go_string config, struct go_string uapiPath,
-                          int32_t bypass, struct go_string dnsConfig);
+                          int32_t bypass, struct go_string dnsConfig,
+                          struct go_string outerConfig);
 extern int32_t updateProxyTunnelPeers(int32_t handle, struct go_string config);
 extern void turnProxyTunnelOff(int32_t handle);
 extern char *getProxyConfig(int32_t handle);
@@ -14,10 +15,10 @@ JNIEXPORT jint JNICALL
 Java_com_wgtunnel_backend_ProxyBackend_startProxy(
         JNIEnv *env, jclass c,
         jint handle, jstring ifName, jstring config, jstring uapiPath,
-        jint bypass, jstring dnsConfigJson)
+        jint bypass, jstring dnsConfigJson, jstring outerConfig)
 {
-    const char *if_p = NULL, *cfg_p = NULL, *uapi_p = NULL, *dns_p = NULL;
-    struct go_string if_g, cfg_g, uapi_g, dns_g;
+    const char *if_p = NULL, *cfg_p = NULL, *uapi_p = NULL, *dns_p = NULL, *outer_p = NULL;
+    struct go_string if_g, cfg_g, uapi_g, dns_g, outer_g;
     int32_t ret;
     (void)c;
 
@@ -25,13 +26,15 @@ Java_com_wgtunnel_backend_ProxyBackend_startProxy(
     cfg_g = jstring_to_go(env, config, &cfg_p);
     uapi_g = jstring_to_go(env, uapiPath, &uapi_p);
     dns_g = jstring_to_go(env, dnsConfigJson, &dns_p);
+    outer_g = jstring_to_go(env, outerConfig, &outer_p);
 
-    ret = startProxy((int32_t)handle, if_g, cfg_g, uapi_g, (int32_t)bypass, dns_g);
+    ret = startProxy((int32_t)handle, if_g, cfg_g, uapi_g, (int32_t)bypass, dns_g, outer_g);
 
     release_jstring(env, ifName, if_p);
     release_jstring(env, config, cfg_p);
     release_jstring(env, uapiPath, uapi_p);
     release_jstring(env, dnsConfigJson, dns_p);
+    release_jstring(env, outerConfig, outer_p);
     return (jint)ret;
 }
 

@@ -12,6 +12,7 @@ internal object VpnBackend {
         settings: String,
         dnsConfigJson: String?,
         uapiPath: String,
+        outerConfig: String?,
     ): Int
 
     external fun updateTunnelPeers(handle: Int, settings: String): Int
