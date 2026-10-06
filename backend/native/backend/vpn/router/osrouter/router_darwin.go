@@ -11,6 +11,7 @@ package osrouter
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/netip"
 	"os/exec"
@@ -30,6 +31,8 @@ import (
 
 const tag = "Router"
 
+var errRouteExists = errors.New("route exists")
+
 type darwinRouter struct {
 	iface       string
 	fw          *osfirewall.DarwinFirewall
@@ -40,6 +43,14 @@ type darwinRouter struct {
 	physicalIfIndex uint32
 	savedGateway4   string
 	savedGateway6   string
+
+	// installed is prefixes we actually added on the tun. Darwin `route delete`
+	// keys on dest/netmask, so deleting a prefix we failed to add (File exists)
+	// removes the physical connected route instead.
+	installed map[netip.Prefix]struct{}
+	// displaced is the physical route that was present before a successful add
+	// of the same dest/netmask, restored when that tun route is removed.
+	displaced map[netip.Prefix]darwinNetRoute
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -61,6 +72,8 @@ func New(iface string, fw firewall.Firewall, tunnel tun.Device) (router.Router, 
 		iface:       name,
 		fw:          fw.(*osfirewall.DarwinFirewall),
 		v6Available: nettest.SupportsIPv6(),
+		installed:   make(map[netip.Prefix]struct{}),
+		displaced:   make(map[netip.Prefix]darwinNetRoute),
 		ctx:         ctx,
 		cancel:      cancel,
 	}, nil
@@ -205,7 +218,11 @@ func (r *darwinRouter) cleanupPreviousState(newC, prevC *router.Config) {
 		if slices.Contains(newC.Routes, rt) {
 			continue
 		}
-		_ = r.route("delete", rt, r.iface, false)
+		if _, ok := r.installed[rt]; ok {
+			_ = r.route("delete", rt, r.iface, false)
+			delete(r.installed, rt)
+		}
+		r.restoreDisplaced(rt)
 		if rt.Bits() == 0 {
 			r.restoreDefault(rt.Addr().Is4())
 		}
@@ -226,11 +243,72 @@ func (r *darwinRouter) applyRoutes(newC, prevC *router.Config) error {
 		if rt.Addr().Is6() && !r.v6Available {
 			continue
 		}
-		if err := r.route("add", rt, r.iface, false); err != nil {
+		existing, exact := r.lookupExactRoute(rt)
+		if exact && existing.iface == r.iface {
+			r.installed[rt] = struct{}{}
+			continue
+		}
+		if exact && rt.Bits() != 0 && existing.iface != "" && existing.iface != r.iface {
+			r.displaced[rt] = existing
+		}
+		err := r.route("add", rt, r.iface, false)
+		if errors.Is(err, errRouteExists) {
+			delete(r.displaced, rt)
+			log.Debug(tag, "skip tun route %v: already exists on %s", rt, existing.iface)
+			continue
+		}
+		if err != nil {
+			delete(r.displaced, rt)
 			return fmt.Errorf("route add %v: %w", rt, err)
 		}
+		r.installed[rt] = struct{}{}
 	}
 	return nil
+}
+
+func (r *darwinRouter) lookupExactRoute(p netip.Prefix) (darwinNetRoute, bool) {
+	args := []string{"-n", "get"}
+	if p.Addr().Is6() {
+		args = append(args, "-inet6")
+	}
+	args = append(args, p.Masked().Addr().String())
+	out, err := exec.Command("route", args...).CombinedOutput()
+	if err != nil {
+		return darwinNetRoute{}, false
+	}
+	rt, ok := parseDarwinRouteGet(string(out), p.Addr().Is6())
+	if !ok || rt.dst != p.Masked() {
+		return darwinNetRoute{}, false
+	}
+	return rt, true
+}
+
+func (r *darwinRouter) restoreDisplaced(p netip.Prefix) {
+	saved, ok := r.displaced[p]
+	if !ok {
+		return
+	}
+	delete(r.displaced, p)
+	if saved.iface == "" || saved.iface == r.iface {
+		return
+	}
+	inet := "inet"
+	if p.Addr().Is6() {
+		inet = "inet6"
+	}
+	nstr := p.Masked().String()
+	var args []string
+	if saved.viaGateway() {
+		args = []string{"-q", "-n", "add", "-" + inet, nstr, saved.gateway}
+	} else {
+		args = []string{"-q", "-n", "add", "-" + inet, nstr, "-iface", saved.iface}
+	}
+	out, err := exec.Command("route", args...).CombinedOutput()
+	if err != nil && !strings.Contains(strings.ToLower(string(out)), "exists") {
+		log.Error(tag, "restore %v via %s: %v (%s)", p, saved.iface, err, strings.TrimSpace(string(out)))
+		return
+	}
+	log.Debug(tag, "restored %v on %s", p, saved.iface)
 }
 
 func (r *darwinRouter) protectPeerEndpoints(newC *router.Config) error {
@@ -353,10 +431,20 @@ func (r *darwinRouter) ifconfig(args ...string) error {
 // touching the existing default, the same technique used for Windows
 func (r *darwinRouter) route(op string, p netip.Prefix, iface string, ifscope bool) error {
 	if p.Bits() == 0 {
+		added := false
 		for _, half := range splitDefaultRoute(p.Addr().Is6()) {
-			if err := r.routeSingle(op, half, iface, ifscope); err != nil {
-				return err
+			err := r.routeSingle(op, half, iface, ifscope)
+			if err == nil {
+				added = true
+				continue
 			}
+			if errors.Is(err, errRouteExists) {
+				continue
+			}
+			return err
+		}
+		if op == "add" && !added {
+			return errRouteExists
 		}
 		return nil
 	}
@@ -396,7 +484,7 @@ func (r *darwinRouter) routeSingle(op string, p netip.Prefix, iface string, ifsc
 			return nil
 		}
 		if op == "add" && strings.Contains(msg, "file exists") {
-			return nil
+			return errRouteExists
 		}
 		return fmt.Errorf("%v: %v (%s)", args, err, strings.TrimSpace(string(out)))
 	}
