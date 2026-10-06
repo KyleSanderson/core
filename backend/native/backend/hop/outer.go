@@ -57,7 +57,7 @@ func Start(config string, bypass bool) (*Outer, error) {
 
 	statusCB := func(code device.StatusCode) {
 		if code != device.StatusHealthy {
-			log.Warn(tag, "status %d", code)
+			log.Error(tag, "status %d", code)
 		}
 	}
 	dev := device.NewDevice(
